@@ -1,4 +1,4 @@
-module douyinkit
+module github.com/Jason-cool/douyinkit
 
 go 1.21
 
