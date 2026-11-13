@@ -1,0 +1,24 @@
+# 运行时数据（浏览器 profile、日志、会话状态等，含登录凭证/Cookies，禁止入库）
+douyinkit-data/
+
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+dist/
+
+# 临时/测试产物
+qr_api_test.png
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db

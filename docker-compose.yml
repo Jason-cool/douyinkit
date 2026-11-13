@@ -1,0 +1,34 @@
+services:
+  douyin:
+    build: .
+    image: douyinkit:latest
+    container_name: douyin-assistant
+    restart: unless-stopped
+
+    # 时区：免打扰时段/消息时间判断依赖本地时间
+    environment:
+      - TZ=Asia/Shanghai
+
+    # Chromium 需要足够的 /dev/shm，默认 64MB 会导致页面渲染崩溃
+    shm_size: "2gb"
+
+    ports:
+      # 二维码服务：宿主机 6060 → 容器 6060
+      # 安全起见可改成只监听内网： "127.0.0.1:6060:6060"
+      - "6060:6060"
+
+    volumes:
+      # 登录态/日志/冷却记录持久化到宿主机，重建容器不丢登录
+      - ./douyinkit-data:/app/douyinkit-data
+
+    # 持续自动回复（真实发送）。
+    # 首次建议先干跑观察：去掉 "-send" 与 "-loop" 两行即可。
+    command:
+      - "-base"
+      - "/app/douyinkit-data"
+      - "-addr"
+      - ":6060"
+      - "-channel"
+      - "chromium"
+      - "-send"
+      - "-loop"
