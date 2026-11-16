@@ -12,10 +12,11 @@ import (
 )
 
 type Logger struct {
-	mu      sync.Mutex
-	f       *os.File
-	UserLog func(format string, args ...any)       // 调用方提供的日志函数（可为 nil，默认打 stdout）
-	Hook    func(name, result string, sent bool)   // 回复事件钩子（OnReply，可为 nil）
+	mu         sync.Mutex
+	f          *os.File
+	UserLog    func(format string, args ...any)     // 调用方提供的日志函数（可为 nil，默认打 stdout）
+	Hook       func(name, result string, sent bool) // 回复事件钩子（OnReply，可为 nil）
+	FollowHook func(f FollowUp)                     // 二次消息截图钩子（OnFollowUp，可为 nil）
 }
 
 func newLogger(base string) *Logger {

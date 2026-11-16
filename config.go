@@ -22,6 +22,11 @@ type Config struct {
 	TypingDelaySeconds    []float64 `json:"typing_delay_seconds"`
 	ReplyGroups           bool      `json:"reply_groups"`       // 群聊一律不自动回复
 	CheckRecentConvs      bool      `json:"check_recent_convs"` // 对「刚刚/N分钟前」的会话主动核对
+
+	// 二次消息跟进：自动回复过一次之后，客户再发消息 → 只截图、不再回复
+	FollowUpScreenshot bool    `json:"followup_screenshot"`  // 是否给客户的二次消息截图
+	FollowUpNoReply    bool    `json:"followup_no_reply"`    // 二次消息不再自动回复
+	FollowUpWatchHours float64 `json:"followup_watch_hours"` // 观察期（小时），0 = 永久
 }
 
 func defaultConfig() *Config {
@@ -35,6 +40,9 @@ func defaultConfig() *Config {
 		TypingDelaySeconds:    []float64{1.5, 3.5},
 		ReplyGroups:           false,
 		CheckRecentConvs:      true,
+		FollowUpScreenshot:    true,
+		FollowUpNoReply:       true,
+		FollowUpWatchHours:    0,
 	}
 }
 

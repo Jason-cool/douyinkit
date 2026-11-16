@@ -1,8 +1,10 @@
 // douyinkit 演示程序 —— 展示库的完整用法：
 //  1. 启动 HTTP 服务（默认 :6060）：GET /qr 返回 JSON（qr_base64/data_url/logged_in），
+//     GET /followups 返回「已自动回复、正在等客户二次消息」的会话（含截图路径），
 //     GET / 返回一个自动刷新的二维码渲染页（前端接入示例）
 //  2. EnsureLogin：未登录则抓二维码（通过 OnQR 回调打印提示），扫码成功后继续
 //  3. 默认干跑一轮；-send -loop 则进入持续自动回复
+//     （自动回复过一次的会话，客户再来消息只截图不回复，见 followup.go）
 //
 // 作为命令行运行：
 //
@@ -55,6 +57,9 @@ func main() {
 		OnReply: func(name, result string, sent bool) {
 			fmt.Printf("【回调】会话=%s 结果=%s 已发送=%v\n", name, result, sent)
 		},
+		OnFollowUp: func(f douyinkit.FollowUp) {
+			fmt.Printf("【二次消息】%s 回复过 %q，客户又来消息 → 截图 %s\n", f.Name, f.ReplyText, f.LastPath)
+		},
 	})
 	if err != nil {
 		fmt.Println("创建客户端失败：", err)
@@ -76,6 +81,15 @@ func main() {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(st)
+		})
+		mux.HandleFunc("/followups", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			list := c.FollowUps()
+			if list == nil {
+				list = []douyinkit.FollowUp{}
+			}
+			_ = json.NewEncoder(w).Encode(list)
 		})
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")

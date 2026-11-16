@@ -28,13 +28,14 @@ import (
 
 // Options 创建 Client 的配置项
 type Options struct {
-	BaseDir   string                               // 数据目录（profile/logs/state/config）。默认 ./douyinkit-data
-	Channel   string                               // 浏览器选择：auto / chrome / chromium / msedge / bundled。默认 auto
-	Headless  *bool                                // nil → Linux 下 true（服务器无头），其他平台 false（本地调试弹窗）
-	Logf      func(format string, args ...any)     // 日志钩子；nil 则输出到 stdout
-	OnQR      func(qr *QRCode)                     // 全局二维码回调（每次刷新都会调用，可为 nil）
-	OnReply   func(name, result string, sent bool) // 每处理一个会话后的回调（可为 nil）
-	QRRefresh time.Duration                        // 等扫码期间二维码重抓周期，默认 30 秒
+	BaseDir    string                               // 数据目录（profile/logs/state/config）。默认 ./douyinkit-data
+	Channel    string                               // 浏览器选择：auto / chrome / chromium / msedge / bundled。默认 auto
+	Headless   *bool                                // nil → Linux 下 true（服务器无头），其他平台 false（本地调试弹窗）
+	Logf       func(format string, args ...any)     // 日志钩子；nil 则输出到 stdout
+	OnQR       func(qr *QRCode)                     // 全局二维码回调（每次刷新都会调用，可为 nil）
+	OnReply    func(name, result string, sent bool) // 每处理一个会话后的回调（可为 nil）
+	OnFollowUp func(f FollowUp)                     // 自动回复过之后客户再来消息：截图完成回调（可为 nil）
+	QRRefresh  time.Duration                        // 等扫码期间二维码重抓周期，默认 30 秒
 }
 
 // Client 抖音私信助手客户端
@@ -42,6 +43,7 @@ type Client struct {
 	opt      Options
 	cfg      *Config
 	hist     map[string]string
+	fu       *followStore
 	lg       *Logger
 	base     string
 	headless bool
@@ -81,10 +83,24 @@ func New(opt Options) (*Client, error) {
 	}
 	lg := newLogger(abs)
 	lg.Hook = opt.OnReply
+	lg.FollowHook = opt.OnFollowUp
+	cfg := loadConfig(filepath.Join(abs, "config.json"))
+	hist := loadHistory(historyPath(abs))
+	fu, fuErr := loadFollowStore(abs)
+	if fuErr != nil {
+		lg.Log("! 二次消息名单读取失败（按空名单继续）：%v", fuErr)
+	}
+	// 升级前已经回复过的会话也纳入观察名单，避免升级后对同一个人再发一遍
+	if cfg.FollowUpNoReply {
+		if n := fu.seedFromHistory(hist, cfg.ReplyText); n > 0 {
+			lg.Log("二次消息观察名单：从历史回复记录补入 %d 个会话（最近 %d 天）", n, followSeedDays)
+		}
+	}
 	return &Client{
 		opt:      opt,
-		cfg:      loadConfig(filepath.Join(abs, "config.json")),
-		hist:     loadHistory(historyPath(abs)),
+		cfg:      cfg,
+		hist:     hist,
+		fu:       fu,
 		lg:       lg,
 		base:     abs,
 		headless: headless,
@@ -296,7 +312,7 @@ func (c *Client) RunOnce(dry bool) (int, error) {
 		return 0, errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
 	c.waitForConvs(30 * time.Second) // 列表没渲染完就扫会扑空
-	return runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, false, false), nil
+	return runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, c.fu, false, false), nil
 }
 
 // SendTo 定向回复指定会话（按昵称匹配，忽略未读标记）。dry=true 只判定不发送。
@@ -311,7 +327,7 @@ func (c *Client) SendTo(name string, dry bool) (int, error) {
 		return 0, errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
 	c.waitForConvs(30 * time.Second)
-	return replyToNamed(c.page, name, c.cfg, dry, c.hist, c.lg, c.base), nil
+	return replyToNamed(c.page, name, c.cfg, dry, c.hist, c.lg, c.base, c.fu), nil
 }
 
 // Run 持续轮询（等价 Windows 版 -send -loop）。页面断开会自动重连（各 3 次重试）。
@@ -331,7 +347,7 @@ func (c *Client) Run(ctx context.Context, dry bool) error {
 	c.mu.Unlock()
 	for {
 		c.mu.Lock()
-		n := runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, false, false)
+		n := runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, c.fu, false, false)
 		page := c.page
 		c.mu.Unlock()
 		_ = n
@@ -388,3 +404,11 @@ func (c *Client) Run(ctx context.Context, dry bool) error {
 
 // Config 运行配置（可在 EnsureLogin 前修改）
 func (c *Client) Config() *Config { return c.cfg }
+
+// FollowUps 返回「已自动回复、正在观察客户二次消息」的会话（最近的排前面）。
+// 记录里带最近一次截图路径，可直接给前端/后台展示。
+func (c *Client) FollowUps() []FollowUp { return c.fu.list() }
+
+// Unwatch 把某个会话移出观察名单（比如你人工接手了这个客户），
+// 之后它再来消息会重新按普通会话自动回复。返回是否真的移除了。
+func (c *Client) Unwatch(name string) bool { return c.fu.remove(name) }

@@ -437,6 +437,32 @@ const JS_ENTER_JS = `(sel) => {
   return true;
 }`
 
+// SCROLL_CHAT_BOTTOM_JS 把右侧消息区滚到最底部。
+// 截图留证时要保证「客户刚发来的那条」在画面里，否则截到的是几天前的历史消息。
+const SCROLL_CHAT_BOTTOM_JS = `() => {
+  const scrollable = e => {
+    const s = getComputedStyle(e);
+    return /auto|scroll/.test(s.overflowY) && e.scrollHeight > e.clientHeight + 20;
+  };
+  // 1) 优先按类名找消息列表容器
+  const named = [...document.querySelectorAll('div')].filter(e =>
+    /MessageList|messageList|ChatList|scrollContainer|messageListBox/i.test(String(e.className || '')) && scrollable(e));
+  let best = named.sort((a, b) => b.scrollHeight - a.scrollHeight)[0] || null;
+  // 2) 兜底：右半屏里最高的可滚动容器
+  if (!best) {
+    let bestH = 0;
+    [...document.querySelectorAll('div')].forEach(e => {
+      const r = e.getBoundingClientRect();
+      if (r.left > window.innerWidth * 0.35 && r.height > bestH && scrollable(e)) {
+        bestH = r.height; best = e;
+      }
+    });
+  }
+  if (!best) return false;
+  best.scrollTop = best.scrollHeight;
+  return true;
+}`
+
 // ELEM_CENTER_JS 取元素中心坐标（给「指针序列点击」用）
 const ELEM_CENTER_JS = `(sel) => {
   const e = document.querySelector(sel);

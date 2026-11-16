@@ -601,7 +601,7 @@ func failShot(page *rod.Page, base, name, tag string) string {
 // ---------------------------------------------------------------- 核心流程
 
 // replyOne 复刻 Python reply_one(page, conv, cfg, dry, hist) -> str
-func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string) string {
+func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string, fs *followStore) string {
 	name := conv.Name
 	// 打开会话：DOM 标记 + 元素点击（浏览器自己算坐标并滚动到可见），
 	// 不再依赖 JS 计算出的坐标——服务器 headless 环境下那套坐标会整体偏移，点了没反应/点错会话
@@ -752,6 +752,8 @@ func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[str
 
 	hist[name] = time.Now().Format("2006-01-02T15:04:05")
 	saveHistory(historyPath(base), hist)
+	// 记进「二次消息观察名单」：之后客户再发消息只截图、不再自动回复
+	fs.markReplied(name, text)
 	return fmt.Sprintf("已回复「%s」", text)
 }
 
@@ -799,7 +801,7 @@ func backFromFolder(page *rod.Page, lg *Logger) {
 }
 
 // processList 复刻 Python process_list：按顺序回复一组会话，返回真正发出的条数
-func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string) int {
+func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string, fs *followStore) int {
 	sent := 0
 	for _, c := range items {
 		if inQuietHours(cfg.QuietHours) {
@@ -815,7 +817,12 @@ func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist m
 			lg.Log("  冷却中，跳过：%s", truncate(key, 20))
 			continue
 		}
-		res := replyOne(page, c, cfg, dry, hist, lg, base)
+		// 已经自动回复过一次：客户再来消息不再回复（截图已在扫描阶段留好）
+		if cfg.FollowUpNoReply && fs.watching(key, cfg.FollowUpWatchHours) {
+			lg.Log("  已自动回复过，二次消息不再回复：%s（截图见 shots/followup）", truncate(key, 20))
+			continue
+		}
+		res := replyOne(page, c, cfg, dry, hist, lg, base, fs)
 		lg.Log("  %q → %s", truncate(key, 20), res)
 		if lg.Hook != nil {
 			lg.Hook(key, res, strings.HasPrefix(res, "已回复"))
@@ -829,7 +836,7 @@ func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist m
 }
 
 // replyToNamed 复刻 Python reply_to_named：定向回复指定会话（忽略未读标记）
-func replyToNamed(page *rod.Page, name string, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string) int {
+func replyToNamed(page *rod.Page, name string, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string, fs *followStore) int {
 	convs := evalConvList(page)
 	var hit *ConvItem
 	for i := range convs {
@@ -871,7 +878,7 @@ func replyToNamed(page *rod.Page, name string, cfg *Config, dry bool, hist map[s
 		return 0
 	}
 
-	res := replyOne(page, *hit, cfg, dry, hist, lg, base)
+	res := replyOne(page, *hit, cfg, dry, hist, lg, base, fs)
 	lg.Log("定向回复 %q → %s", name, res)
 	if lg.Hook != nil {
 		lg.Hook(name, res, strings.HasPrefix(res, "已回复"))
@@ -887,7 +894,7 @@ func replyToNamed(page *rod.Page, name string, cfg *Config, dry bool, hist map[s
 
 // runOnce 复刻 Python run_once：一轮完整扫描
 func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string,
-	listOnly bool, dump bool) int {
+	fs *followStore, listOnly bool, dump bool) int {
 	convs := evalConvList(page)
 	if len(convs) == 0 {
 		lg.Log("没扫到会话（可能列表还没加载完，或页面结构变了）")
@@ -925,6 +932,13 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 
 	sent := 0
 
+	// ---- 0) 二次消息核对：已经自动回复过的会话，客户再发消息 → 截图留证，不回复 ----
+	if cfg.FollowUpScreenshot {
+		if n := scanFollowUps(page, normals, cfg, fs, dry, lg, base); n > 0 {
+			lg.Log("二次消息截图：本轮 %d 张（%s）", n, filepathJoin(base, "shots", "followup"))
+		}
+	}
+
 	// ---- 1) 普通会话（互关/已建立会话的私信） ----
 	var targets []ConvItem
 	for _, c := range normals {
@@ -960,7 +974,7 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 		}
 	}
 	if len(targets) > 0 {
-		sent += processList(page, targets, cfg, dry, hist, lg, base)
+		sent += processList(page, targets, cfg, dry, hist, lg, base, fs)
 	}
 
 	// ---- 2) 陌生人消息（非互关用户的私信会折叠在这里） ----
@@ -992,6 +1006,11 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 			lg.Log("    ·%s %q  预览：%q", flag, truncate(c.Name, 24), truncate(c.Preview, 26))
 		}
 
+		// 陌生人消息里也可能有「已自动回复过、客户又来的」会话 —— 同样只截图不回复
+		if cfg.FollowUpScreenshot {
+			scanFollowUps(page, innerAll, cfg, fs, dry, lg, base)
+		}
+
 		var picked []ConvItem
 		if len(innerUnread) > 0 {
 			picked = innerUnread
@@ -1008,7 +1027,7 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 			}
 		}
 		if len(pg) > 0 {
-			sent += processList(page, pg, cfg, dry, hist, lg, base)
+			sent += processList(page, pg, cfg, dry, hist, lg, base, fs)
 		}
 
 		backFromFolder(page, lg)

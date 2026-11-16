@@ -67,6 +67,8 @@ replace douyinkit => /path/to/抖音私信助手-Linux
 | `(*Client) LatestQR() (*QRCode, bool)` | 取最近一次二维码（给 `/qr` 这类接口用） |
 | `(*Client) RunOnce(dry bool) (int, error)` | 跑一轮，返回真实发送条数 |
 | `(*Client) Run(ctx, dry bool) error` | 持续轮询，页面挂了自动重连（3+3 次重试） |
+| `(*Client) FollowUps() []FollowUp` | 已自动回复、正在观察客户二次消息的会话（含最近截图路径） |
+| `(*Client) Unwatch(name string) bool` | 把会话移出观察名单（人工接手后可恢复正常自动回复） |
 | `(*Client) Close()` | 关闭浏览器 |
 
 `QRCode` 结构：`Base64`（纯 base64）、`DataURL`（`data:image/png;base64,...`）、`CapturedAt`。
@@ -131,6 +133,62 @@ type LoginStatus struct {
 > 触发场景很常见：容器/服务器上的 profile 里只剩 `ttwid`、`odin_tt` 这类匿名 cookie（没有 `sessionid`），
 > 前端路由误以为已登录，于是停在骨架屏，既不给二维码也不给登录框 —— 旧版会直接报「没找到二维码元素」退出。
 
+
+### 二次消息跟进：自动回复过一次之后，客户再来只截图不回复
+
+规则：**每个会话只自动回复一次**。发出「晚点回复您」这类话术成功后，该会话进入观察名单；
+之后客户再发消息，程序不再回复，而是把聊天页截图存下来（`BaseDir/shots/followup/`），
+并通过 `Options.OnFollowUp` 回调通知你（可在回调里发企业微信/邮件/入库）。
+
+```go
+c, _ := douyinkit.New(douyinkit.Options{
+    BaseDir: "/data/douyin",
+    OnFollowUp: func(f douyinkit.FollowUp) {
+        // f.Name 客户昵称、f.LastPath 截图路径、f.LastText 客户这条消息、f.Shots 第几次
+        log.Printf("客户 %s 又来信了：%s（截图 %s）", f.Name, f.LastText, f.LastPath)
+    },
+})
+
+// 人工接手后可解除观察，之后它再来消息会重新自动回复
+c.Unwatch("某客户昵称")
+for _, f := range c.FollowUps() { ... }   // 当前观察名单
+```
+
+行为细节：
+
+- **只截一次**：同一条消息按文字去重，反复轮询不会刷出一堆相同截图；
+- **截最新画面**：截图前先把消息区滚到底，保证客户刚发的那条在画面里，昵称也能看到（便于确认是谁）；
+- **重启不丢**：观察名单持久化在 `state/followup.json`，进程重启后依旧只截图不回复；
+- **干跑不落盘**：`RunOnce(true)` / `-send` 未开启时只在日志里提示，不写文件、不回复；
+- **陌生人消息里也生效**：折叠在「陌生人消息」入口内的会话同样只截图不再回复；
+- **名单会一直保留**（`followup_watch_hours: 0`）；想让它 N 小时后恢复自动回复，把该值改成小时数即可。
+
+配置项（`BaseDir/config.json`，缺省即下列值）：
+
+```json
+{
+  "followup_screenshot": true,   // 客户二次消息自动截图
+  "followup_no_reply": true,     // 二次消息不再自动回复
+  "followup_watch_hours": 0      // 观察期（小时），0 = 永久
+}
+```
+
+`FollowUp` 结构：
+
+```go
+type FollowUp struct {
+    Name       string     `json:"name"`         // 会话昵称
+    ReplyText  string     `json:"reply_text"`   // 当时自动回复的内容
+    RepliedAt  time.Time  `json:"replied_at"`   // 自动回复时间
+    Shots      int        `json:"shots"`        // 已截图次数
+    LastText   string     `json:"last_text"`    // 最近一次截图对应的客户消息
+    LastPath   string     `json:"last_path"`    // 最近一次截图文件
+    LastShotAt *time.Time `json:"last_shot_at"`
+}
+```
+
+> 截图是 1440×900 的整页视口截图（含会话列表 + 聊天区 + 顶部昵称），不做裁剪，
+> 方便人工判断上下文；如果只要聊天区，可在 `OnFollowUp` 里按 `LastPath` 再裁。
 
 ### 关于点击方式（Linux 服务器必读）
 
@@ -328,13 +386,16 @@ GOOS=linux GOARCH=arm64 go build -o dist/douyinkit-demo-linux-arm64 ./cmd/demo
   config.json            配置文件（不存在则用默认值，可随时手改，重启生效）
   session/profile/       浏览器登录态（= 账号凭证，别外传）
   state/replied.json     冷却记录（昵称 → 上次回复时间），与 Windows/Python 版格式互通
+  state/followup.json    二次消息观察名单（已回复过的会话、截图次数、最近截图）
   logs/2026-11-11.log    运行日志（每个跳过原因都在这里）
   shots/                 干跑/异常截图
+  shots/followup/        客户二次消息截图（每个客户按时间命名，人工跟进用）
 ```
 
 `config.json` 字段与 Windows 版一致：`reply_text`、`same_user_cooldown_hours`、
 `max_replies_per_hour`、`poll_interval_seconds`、`quiet_hours`、`skip_if_last_msg_is_mine`、
-`typing_delay_seconds`、`reply_groups`、`check_recent_convs`。
+`typing_delay_seconds`、`reply_groups`、`check_recent_convs`；
+新增 `followup_screenshot`、`followup_no_reply`、`followup_watch_hours`（见上一节）。
 
 ---
 
