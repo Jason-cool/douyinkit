@@ -817,9 +817,18 @@ func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist m
 			lg.Log("  冷却中，跳过：%s", truncate(key, 20))
 			continue
 		}
-		// 已经自动回复过一次：客户再来消息不再回复（截图已在扫描阶段留好）
+		// 已经自动回复过一次：客户再来消息不再回复（有新消息时由扫描阶段截图）
 		if cfg.FollowUpNoReply && fs.watching(key, cfg.FollowUpWatchHours) {
-			lg.Log("  已自动回复过，二次消息不再回复：%s（截图见 shots/followup）", truncate(key, 20))
+			switch {
+			case dry:
+				lg.Log("  已自动回复过，二次消息不再回复：%s（干跑模式，不产生截图）", truncate(key, 20))
+			default:
+				if f, ok := fs.get(key); ok && f.LastPath != "" {
+					lg.Log("  已自动回复过，二次消息不再回复：%s（最近截图 %s）", truncate(key, 20), baseName(f.LastPath))
+				} else {
+					lg.Log("  已自动回复过，二次消息不再回复：%s（客户暂无新消息，暂无截图）", truncate(key, 20))
+				}
+			}
 			continue
 		}
 		res := replyOne(page, c, cfg, dry, hist, lg, base, fs)

@@ -269,6 +269,30 @@ setInterval(async () => {
 </script>
 ```
 
+### 2.1 独立小工具（每个方法一个 demo，可单独跑）
+
+每个工具只干一件事，都支持统一基础参数 `-base / -account / -headless / -channel`：
+
+| 工具 | 作用 | 典型用法 |
+|---|---|---|
+| `cmd/login` | **只登录**：出二维码等扫码，成功即退出 | `go run ./cmd/login`；无头用 `go run ./cmd/login -headless yes` 然后打开 `qr.html` 扫 |
+| `cmd/qr` | **只取二维码/状态**：一次输出 JSON 或起 HTTP 接口 | `go run ./cmd/qr`；常驻接口 `go run ./cmd/qr -serve :6060` |
+| `cmd/reply` | **只自动回复**：一轮/持续/定向，不含二维码页面 | `go run ./cmd/reply -send -loop`；干跑去掉 `-send` |
+| `cmd/autoreply` | **只设置自动回复开关**：改 config.json，不启动浏览器 | `go run ./cmd/autoreply -off`（关）/ `-on`（开）/ 不带参查看 |
+| `cmd/followups` | **只看/管理二次消息观察名单**：不启动浏览器 | `go run ./cmd/followups`；解除观察 `go run ./cmd/followups -unwatch 昵称` |
+
+多账号统一加 `-account 账号名`（数据目录变为 `<base>/<账号名>`），例如：
+
+```bash
+go run ./cmd/login -account 店铺A            # 给店铺A扫码
+go run ./cmd/autoreply -account 店铺B -off   # 关掉店铺B的自动回复
+go run ./cmd/followups -account 店铺A        # 看店铺A的观察名单
+```
+
+对应库方法：login→`Connect/EnsureLogin`，qr→`QRStatus`，reply→`RunOnce/Run/SendTo`，
+autoreply→`Options.AutoReply/Config.AutoReply`（运行中切换用 `SetAutoReply`），
+followups→`FollowUps/Unwatch`。
+
 ---
 
 ## 3. Docker 部署（推荐，规避 glibc 过旧）
