@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-// Config 对应 Python 版 DEFAULT_CONFIG + config.json（_comment 字段自动忽略）
+// Config 运行配置。作为库被引用时推荐用 DefaultConfig() 拿一份默认值改好，
+// 通过 Options.Config 传入；CLI 场景不传则读 BaseDir/config.json（没有就用默认值）。
 type Config struct {
 	ReplyText             string    `json:"reply_text"`
 	SameUserCooldownHours float64   `json:"same_user_cooldown_hours"`
@@ -22,11 +23,31 @@ type Config struct {
 	TypingDelaySeconds    []float64 `json:"typing_delay_seconds"`
 	ReplyGroups           bool      `json:"reply_groups"`       // 群聊一律不自动回复
 	CheckRecentConvs      bool      `json:"check_recent_convs"` // 对「刚刚/N分钟前」的会话主动核对
+	AutoReply             bool      `json:"auto_reply"`         // 自动回复总开关；false = 该账号只观察/截图，不发送
 
 	// 二次消息跟进：自动回复过一次之后，客户再发消息 → 只截图、不再回复
 	FollowUpScreenshot bool    `json:"followup_screenshot"`  // 是否给客户的二次消息截图
 	FollowUpNoReply    bool    `json:"followup_no_reply"`    // 二次消息不再自动回复
 	FollowUpWatchHours float64 `json:"followup_watch_hours"` // 观察期（小时），0 = 永久
+}
+
+// DefaultConfig 返回一份默认配置。作为库引用时建议以它为起点改字段再传入，
+// 避免手写 struct 漏掉默认值（漏了 bool 字段会变成 false）。
+func DefaultConfig() *Config { return defaultConfig() }
+
+// clone 深拷贝（切片字段单独复制，避免多账号共享底层数组）
+func (c *Config) clone() *Config {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if c.QuietHours != nil {
+		cp.QuietHours = append([]string(nil), c.QuietHours...)
+	}
+	if c.TypingDelaySeconds != nil {
+		cp.TypingDelaySeconds = append([]float64(nil), c.TypingDelaySeconds...)
+	}
+	return &cp
 }
 
 func defaultConfig() *Config {
@@ -40,6 +61,7 @@ func defaultConfig() *Config {
 		TypingDelaySeconds:    []float64{1.5, 3.5},
 		ReplyGroups:           false,
 		CheckRecentConvs:      true,
+		AutoReply:             true,
 		FollowUpScreenshot:    true,
 		FollowUpNoReply:       true,
 		FollowUpWatchHours:    0,

@@ -44,3 +44,13 @@ func (lg *Logger) Log(format string, args ...any) {
 		_ = lg.f.Sync()
 	}
 }
+
+// Close 关闭日志文件句柄（进程退出前调用；Close 后再 Log 只会丢文件输出）
+func (lg *Logger) Close() {
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	if lg.f != nil {
+		_ = lg.f.Close()
+		lg.f = nil
+	}
+}

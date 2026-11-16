@@ -28,7 +28,7 @@ import (
 
 // Options 创建 Client 的配置项
 type Options struct {
-	BaseDir    string                               // 数据目录（profile/logs/state/config）。默认 ./douyinkit-data
+	BaseDir    string                               // 数据目录（profile/logs/state/config）。默认 ./douyinkit-data；多账号时传根目录，用 Manager 分账号
 	Channel    string                               // 浏览器选择：auto / chrome / chromium / msedge / bundled。默认 auto
 	Headless   *bool                                // nil → Linux 下 true（服务器无头），其他平台 false（本地调试弹窗）
 	Logf       func(format string, args ...any)     // 日志钩子；nil 则输出到 stdout
@@ -36,6 +36,10 @@ type Options struct {
 	OnReply    func(name, result string, sent bool) // 每处理一个会话后的回调（可为 nil）
 	OnFollowUp func(f FollowUp)                     // 自动回复过之后客户再来消息：截图完成回调（可为 nil）
 	QRRefresh  time.Duration                        // 等扫码期间二维码重抓周期，默认 30 秒
+
+	Account   string  // 账号名：日志前缀；用 Manager 管理多账号时会自动填写
+	Config    *Config // 配置传参（推荐 douyinkit.DefaultConfig() 改好传入）；nil → 读 BaseDir/config.json，没有则默认值
+	AutoReply *bool   // 该账号是否自动回复；nil = 不覆盖。false 时只做二次消息截图/观察，不发送任何消息
 }
 
 // Client 抖音私信助手客户端
@@ -84,7 +88,29 @@ func New(opt Options) (*Client, error) {
 	lg := newLogger(abs)
 	lg.Hook = opt.OnReply
 	lg.FollowHook = opt.OnFollowUp
+	// 多账号时给日志加账号前缀，方便区分不同账号的输出
+	if opt.Account != "" {
+		if inner := lg.UserLog; inner != nil {
+			name := opt.Account
+			lg.UserLog = func(format string, args ...any) {
+				inner("[%s] %s", name, fmt.Sprintf(format, args...))
+			}
+		} else {
+			name := opt.Account
+			lg.UserLog = func(format string, args ...any) {
+				fmt.Printf("[%s] %s\n", name, fmt.Sprintf(format, args...))
+			}
+		}
+	}
+	// 配置优先级：Options.Config（传参）> BaseDir/config.json（文件）> 默认值；
+	// Options.AutoReply 是最后一级覆盖，方便只开关自动回复而不用动整份配置
 	cfg := loadConfig(filepath.Join(abs, "config.json"))
+	if opt.Config != nil {
+		cfg = opt.Config.clone()
+	}
+	if opt.AutoReply != nil {
+		cfg.AutoReply = *opt.AutoReply
+	}
 	hist := loadHistory(historyPath(abs))
 	fu, fuErr := loadFollowStore(abs)
 	if fuErr != nil {
@@ -327,6 +353,9 @@ func (c *Client) SendTo(name string, dry bool) (int, error) {
 		return 0, errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
 	c.waitForConvs(30 * time.Second)
+	if !c.cfg.AutoReply {
+		return 0, errors.New("该账号已关闭自动回复（SetAutoReply(false) / Options.AutoReply=false）")
+	}
 	return replyToNamed(c.page, name, c.cfg, dry, c.hist, c.lg, c.base, c.fu), nil
 }
 
@@ -404,6 +433,22 @@ func (c *Client) Run(ctx context.Context, dry bool) error {
 
 // Config 运行配置（可在 EnsureLogin 前修改）
 func (c *Client) Config() *Config { return c.cfg }
+
+// Account 当前账号名（Manager 创建时填写；单账号直连时为空）
+func (c *Client) Account() string { return c.opt.Account }
+
+// SetAutoReply 运行时开关该账号的自动回复，下一次轮询生效。
+// 关掉后：不再发送任何消息，但二次消息截图/观察照常。
+func (c *Client) SetAutoReply(on bool) {
+	c.cfg.AutoReply = on
+	if c.lg != nil {
+		if on {
+			c.lg.Log("已开启自动回复")
+		} else {
+			c.lg.Log("已关闭自动回复（不再发送任何消息，二次消息照常截图）")
+		}
+	}
+}
 
 // FollowUps 返回「已自动回复、正在观察客户二次消息」的会话（最近的排前面）。
 // 记录里带最近一次截图路径，可直接给前端/后台展示。

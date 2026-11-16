@@ -940,45 +940,53 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 	}
 
 	// ---- 1) 普通会话（互关/已建立会话的私信） ----
-	var targets []ConvItem
-	for _, c := range normals {
-		if c.Unread && !looksLikeGroup(c) {
-			targets = append(targets, c)
-		}
-	}
-
-	// 红点不一定出现（实测新消息到达时主列表可能没有红点），
-	// 所以对「刚刚 / N分钟前」的会话再核对一次最后一条是谁说的。
-	if cfg.CheckRecentConvs {
+	// 自动回复总开关关掉的账号：不构建回复目标，完全不发送
+	if cfg.AutoReply {
+		var targets []ConvItem
 		for _, c := range normals {
-			inTargets := false
-			for _, t := range targets {
-				if t.Name == c.Name && t.Y == c.Y {
-					inTargets = true
-					break
+			if c.Unread && !looksLikeGroup(c) {
+				targets = append(targets, c)
+			}
+		}
+
+		// 红点不一定出现（实测新消息到达时主列表可能没有红点），
+		// 所以对「刚刚 / N分钟前」的会话再核对一次最后一条是谁说的。
+		if cfg.CheckRecentConvs {
+			for _, c := range normals {
+				inTargets := false
+				for _, t := range targets {
+					if t.Name == c.Name && t.Y == c.Y {
+						inTargets = true
+						break
+					}
+				}
+				if inTargets || looksLikeGroup(c) {
+					continue
+				}
+				if isRecent(c) {
+					targets = append(targets, c)
+					lg.Log("  最近活跃，纳入核对：%q", truncate(c.Name, 18))
 				}
 			}
-			if inTargets || looksLikeGroup(c) {
-				continue
-			}
-			if isRecent(c) {
-				targets = append(targets, c)
-				lg.Log("  最近活跃，纳入核对：%q", truncate(c.Name, 18))
-			}
 		}
-	}
 
-	for _, c := range normals {
-		if c.Unread && looksLikeGroup(c) {
-			lg.Log("  跳过群聊，不点开：%s", truncate(c.Name, 20))
+		for _, c := range normals {
+			if c.Unread && looksLikeGroup(c) {
+				lg.Log("  跳过群聊，不点开：%s", truncate(c.Name, 20))
+			}
 		}
-	}
-	if len(targets) > 0 {
-		sent += processList(page, targets, cfg, dry, hist, lg, base, fs)
+		if len(targets) > 0 {
+			sent += processList(page, targets, cfg, dry, hist, lg, base, fs)
+		}
+	} else {
+		lg.Log("本账号已关闭自动回复（auto_reply=false），只观察/截图，不发送")
 	}
 
 	// ---- 2) 陌生人消息（非互关用户的私信会折叠在这里） ----
 	for _, f := range folders {
+		if !f.Unread && !dump && !cfg.AutoReply {
+			continue // 关闭自动回复的账号：入口没红点就不点开（点开只为内部截图/回复）
+		}
 		if !f.Unread && !dump {
 			lg.Log("  陌生人消息入口无红点，跳过")
 			continue
@@ -1018,6 +1026,12 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 			// 子项没有红点时，取最近的一个（列表按时间倒序）
 			picked = innerAll[:1]
 			lg.Log("  子项无红点，按最近一条处理")
+		}
+
+		// 自动回复已关闭：内部只做截图，不回复
+		if !cfg.AutoReply {
+			backFromFolder(page, lg)
+			continue
 		}
 
 		var pg []ConvItem
