@@ -280,6 +280,7 @@ setInterval(async () => {
 | `cmd/reply` | **只自动回复**：一轮/持续/定向，不含二维码页面 | `go run ./cmd/reply -send -loop`；干跑去掉 `-send` |
 | `cmd/autoreply` | **只设置自动回复开关**：改 config.json，不启动浏览器 | `go run ./cmd/autoreply -off`（关）/ `-on`（开）/ 不带参查看 |
 | `cmd/followups` | **只看/管理二次消息观察名单**：不启动浏览器 | `go run ./cmd/followups`；解除观察 `go run ./cmd/followups -unwatch 昵称` |
+| `cmd/gate` | **是否启动 Run 的开关演示**：闸门关不轮询，运行中可开/关/启/停 | `go run ./cmd/gate -no-reply`；接口 `/status` `/toggle` `/start` `/stop` `/qr` |
 
 多账号统一加 `-account 账号名`（数据目录变为 `<base>/<账号名>`），例如：
 
@@ -291,7 +292,7 @@ go run ./cmd/followups -account 店铺A        # 看店铺A的观察名单
 
 对应库方法：login→`Connect/EnsureLogin`，qr→`QRStatus`，reply→`RunOnce/Run/SendTo`，
 autoreply→`Options.AutoReply/Config.AutoReply`（运行中切换用 `SetAutoReply`），
-followups→`FollowUps/Unwatch`。
+followups→`FollowUps/Unwatch`，gate→`Run` 的启动时机 + `SetAutoReply` 运行中切换。
 
 ---
 
