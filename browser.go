@@ -59,13 +59,37 @@ func killStaleChrome(dir string) {
 // （v3.1 之前 Windows 直接跳过清理，导致本地残留浏览器后每次启动都报
 // "Failed to get the debug url: exit status 1"，只能手动杀进程。）
 func killStaleChromeWindows(dir string) {
+	ps := windowsPowerShell()
+	if ps == "" {
+		return // 连 PowerShell 都找不到，只能靠后面的启动重试
+	}
 	script := "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" | " +
 		"Where-Object { $_.CommandLine -and $_.CommandLine -like (\"*\" + $env:DY_PROFILE_DIR + \"*\") } | " +
 		"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	cmd := exec.Command(ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
 	cmd.Env = append(os.Environ(), "DY_PROFILE_DIR="+dir)
 	_ = cmd.Run()
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond) // 等进程真正释放 profile 句柄
+}
+
+// windowsPowerShell 返回 PowerShell 可执行文件的绝对路径。
+// 不能直接 exec.Command("powershell")：从 Git Bash、计划任务或精简 PATH 的环境启动时，
+// PATH 里常常没有 System32，会报 "executable file not found"，自检静默失效 ——
+// 表现就是残留浏览器一直杀不掉、每次启动都「Failed to get the debug url」。
+func windowsPowerShell() string {
+	if p, err := exec.LookPath("powershell"); err == nil {
+		return p
+	}
+	for _, root := range []string{os.Getenv("SystemRoot"), os.Getenv("windir"), `C:\Windows`} {
+		if root == "" {
+			continue
+		}
+		p := filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
 }
 
 func historyPath(base string) string { return filepath.Join(base, "state", "replied.json") }

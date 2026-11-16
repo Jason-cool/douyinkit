@@ -21,7 +21,7 @@ import (
 	"os/signal"
 	"time"
 
-	douyinkit "douyinkit"
+	douyinkit "github.com/Jason-cool/douyinkit"
 )
 
 func main() {
@@ -68,13 +68,14 @@ func main() {
 		mux.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
-			out := map[string]any{"logged_in": c.IsLoggedInCached()}
-			if qr, ok := c.LatestQR(); ok {
-				out["qr_base64"] = qr.Base64
-				out["data_url"] = qr.DataURL
-				out["captured_at"] = qr.CapturedAt.Format(time.RFC3339)
+			// 接口内部就是调用库方法，保证示例与库行为完全一致
+			st, err := c.QRStatus()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
 			}
-			_ = json.NewEncoder(w).Encode(out)
+			_ = json.NewEncoder(w).Encode(st)
 		})
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")

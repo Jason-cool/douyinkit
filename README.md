@@ -15,7 +15,13 @@
 ## 1. 作为库引用
 
 ```go
-import douyinkit "douyinkit"   // 本地用 go.mod replace 指到本目录，或发布到你自己的仓库
+import douyinkit "github.com/Jason-cool/douyinkit"
+
+// 方式一：发布到自己的仓库后
+//   go get github.com/Jason-cool/douyinkit
+// 方式二：不发布，本地用 replace 指到本目录
+//   require github.com/Jason-cool/douyinkit v0.0.0
+//   replace github.com/Jason-cool/douyinkit => /path/to/douyinkit
 
 c, err := douyinkit.New(douyinkit.Options{
     BaseDir: "/var/lib/douyin",        // 登录态/日志/冷却记录都放这里
@@ -56,6 +62,7 @@ replace douyinkit => /path/to/抖音私信助手-Linux
 | `(*Client) Connect() error` | 启动/复用无头浏览器并打开私信页，幂等 |
 | `(*Client) IsLoggedIn() bool` | 是否已登录（按需自动 Connect） |
 | `(*Client) EnsureLogin(ctx, onQR) error` | **未登录时抓二维码 + 推给回调 + 等扫码**；已登录秒返回 |
+| `(*Client) QRStatus() (*LoginStatus, error)` | **一次拿到「已登录 / 未登录+二维码」**，等价于 `/qr` 接口但不用起 HTTP（见下） |
 | `(*Client) FetchQR() (*QRCode, error)` | 主动抓一张当前二维码（含过期自动刷新） |
 | `(*Client) LatestQR() (*QRCode, bool)` | 取最近一次二维码（给 `/qr` 这类接口用） |
 | `(*Client) RunOnce(dry bool) (int, error)` | 跑一轮，返回真实发送条数 |
@@ -64,6 +71,44 @@ replace douyinkit => /path/to/抖音私信助手-Linux
 
 `QRCode` 结构：`Base64`（纯 base64）、`DataURL`（`data:image/png;base64,...`）、`CapturedAt`。
 
+### QRStatus：不用起接口，一次拿到「已登录 / 二维码」
+
+`QRStatus` 就是演示程序 `GET /qr` 的库内版本，导包后直接调用，返回结构与接口 JSON 一致：
+
+```go
+st, err := c.QRStatus()
+switch {
+case err != nil:
+    log.Println("取二维码失败：", err)
+case st.LoggedIn:
+    fmt.Println(st.Text())      // "已登录"
+default:
+    fmt.Println(st.Text())      // "未登录，请用抖音 App 扫码"
+    fmt.Println(st.DataURL)     // data:image/png;base64,... → 前端 <img src>
+    // st.QRBase64 是纯 base64（PNG 字节），走 JSON 给前端时用它
+}
+```
+
+```go
+// LoginStatus（字段与 /qr 的 JSON 完全一致，可直接 json.Marshal 给前端）
+type LoginStatus struct {
+    LoggedIn   bool       `json:"logged_in"`
+    QRBase64   string     `json:"qr_base64,omitempty"`
+    DataURL    string     `json:"data_url,omitempty"`
+    CapturedAt *time.Time `json:"captured_at,omitempty"`
+}
+```
+
+行为约定：
+
+- **已登录** → `LoggedIn=true`，不带二维码（不会去截屏）；
+- **未登录** → 返回可直接渲染的二维码，必要时现场抓取（含骨架屏自愈）；90 秒内的二维码走缓存，不会每次轮询都截屏；
+- **首次调用**会自动 `Connect`（多花十来秒启动浏览器）；
+- **并发**：如果另一个 goroutine 正在抓码（例如 `EnsureLogin` 在跑），本次**立即**返回空状态 `{}`，不阻塞，3 秒后重试即可；
+- 浏览器启动失败后 10 秒内不会重复尝试（避免前端每 3 秒轮询把 CPU 打满）。
+
+前端典型用法：每 3 秒调一次，`logged_in=false` 且有 `data_url` 就渲染，`logged_in=true` 就跳转。
+
 > 二维码来自登录页元素 `#douyin_login_comp_scan_code_qrcode` 的**元素截图**（canvas 渲染，没有图片地址），
 > 实测 180×180、清晰可扫；页面提示「已失效/点击刷新」时会自动点刷新，找不到按钮就整页重载重抓。
 > 抓取轮询周期默认 30 秒（`Options.QRRefresh` 可改），二维码换了就再次回调 `OnQR`。
@@ -71,10 +116,17 @@ replace douyinkit => /path/to/抖音私信助手-Linux
 **v3.2 起加了「二维码自愈」**（解决「页面停在私信页骨架屏，前端一直显示『等待二维码』」）：
 
 - 抓码改成**轮询**（每 600ms 探一次元素，最长等 30 秒），登录页渲染慢也能等到，不再一次性超时；
+- **抓到的图要过图像校验**：统计深色像素占比，只画了 logo、格子还没渲染的「半成品」会被丢掉继续等
+  （否则前端拿到一张空二维码，扫码毫无反应）；
 - 页面既没有二维码、也没有登录浮层时，判定为「残留登录态卡死」，**自动清 cookie + localStorage/sessionStorage
   后重载回游客态**（实测清完 3~4 秒内抖音自己弹出登录框并渲染二维码）；
 - 有登录 cookie 时先软重载（不清 cookie，避免误删有效登录态），确实失效了才清；
 - `EnsureLogin` 抓码失败会重试 3 次；demo 进程也不因一次失败退出，**HTTP 二维码服务常驻**，10 秒后自动重试。
+
+**Windows 启动自检**：从 Git Bash / 精简 PATH 的环境启动时 `PATH` 里没有 `System32`，
+`exec.Command("powershell")` 会直接 "executable file not found"，导致残留浏览器杀不掉、
+每次启动都报 `Failed to get the debug url`。现在改用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`
+绝对路径，启动前会先清掉占着同一 profile 的旧 chrome/msedge（不会碰你自己的浏览器）。
 
 > 触发场景很常见：容器/服务器上的 profile 里只剩 `ttwid`、`odin_tt` 这类匿名 cookie（没有 `sessionid`），
 > 前端路由误以为已登录，于是停在骨架屏，既不给二维码也不给登录框 —— 旧版会直接报「没找到二维码元素」退出。

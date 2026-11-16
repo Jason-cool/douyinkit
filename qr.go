@@ -5,8 +5,10 @@ package douyinkit
 // 二维码过期时页面出现「点击刷新」，优先点刷新按钮，找不到就整页重载。
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"image/png"
 	"path/filepath"
 	"regexp"
 	"time"
@@ -113,8 +115,8 @@ func (c *Client) grabQR(timeout time.Duration) *QRCode {
 				continue
 			}
 			data, err := el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
-			if err != nil || len(data) < 1200 { // 太小 = 空白占位图
-				continue
+			if err != nil || !looksLikeQR(data) {
+				continue // 空白 / 只画了 logo 的半成品，继续等它渲染完
 			}
 			b64 := base64.StdEncoding.EncodeToString(data)
 			return &QRCode{
@@ -128,6 +130,36 @@ func (c *Client) grabQR(timeout time.Duration) *QRCode {
 		}
 		wait(600)
 	}
+}
+
+// looksLikeQR 判断截图是不是「画完了」的二维码。
+// 抖音的二维码是 canvas 异步绘制的：先出白色圆角底板 + 抖音 logo，几百毫秒后才填上黑格子。
+// 只判断字节数会把「只有 logo 的半成品」当成二维码发给前端，用户扫半天没反应。
+// 这里解码 PNG 统计深色像素占比：真二维码约 25%~55%，只有 logo 时不足 8%。
+func looksLikeQR(data []byte) bool {
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return false
+	}
+	b := img.Bounds()
+	if b.Dx() < 80 || b.Dy() < 80 {
+		return false
+	}
+	var total, dark int
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			r, g, bl, _ := img.At(x, y).RGBA()
+			if r>>8 < 110 && g>>8 < 110 && bl>>8 < 110 {
+				dark++
+			}
+			total++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	ratio := float64(dark) / float64(total)
+	return ratio > 0.12 && ratio < 0.75
 }
 
 // resetGuestLocked 把页面强制打回「游客态」：清 cookie + 前端 storage，再重载私信页。
@@ -154,4 +186,81 @@ func (c *Client) setLastQR(qr *QRCode) {
 	c.mu.Lock()
 	c.lastQR = qr
 	c.mu.Unlock()
+}
+
+// ---------- 一站式登录状态：等价于演示程序的 GET /qr，但不需要起 HTTP 接口 ----------
+
+// LoginStatus 一次登录状态查询的结果，字段与 GET /qr 的 JSON 完全一致：
+// 可以直接 json.Marshal 返回给前端，也可以取 DataURL 塞进 <img src>。
+type LoginStatus struct {
+	LoggedIn   bool       `json:"logged_in"`
+	QRBase64   string     `json:"qr_base64,omitempty"` // 纯 base64（PNG 字节）
+	DataURL    string     `json:"data_url,omitempty"`  // data:image/png;base64,...
+	CapturedAt *time.Time `json:"captured_at,omitempty"`
+}
+
+// Text 可直接展示的中文状态
+func (s LoginStatus) Text() string {
+	if s.LoggedIn {
+		return "已登录"
+	}
+	return "未登录，请用抖音 App 扫码"
+}
+
+// qrCacheTTL 二维码缓存有效期：抖音二维码约 2 分钟失效，提前到 90 秒重抓
+const qrCacheTTL = 90 * time.Second
+
+// QRStatus 一次拿到「是否已登录 / 未登录时的二维码」，不需要自己起 HTTP 接口：
+//   - 已登录：返回 LoggedIn=true，不带二维码；
+//   - 未登录：返回可直接渲染的二维码（DataURL），必要时现场抓取（含骨架屏自愈）；
+//   - 浏览器没连接会自动 Connect（首次调用会多花十来秒启动）。
+//
+// 导包后直接调用：
+//
+//	st, err := c.QRStatus()
+//	if err != nil {
+//	    log.Println("取二维码失败：", err)
+//	} else if st.LoggedIn {
+//	    fmt.Println(st.Text())   // 已登录
+//	} else {
+//	    fmt.Println(st.DataURL)  // data:image/png;base64,... → 前端 <img src>
+//	}
+//
+// 建议前端每 3 秒调一次：未登录期间二维码换新会自动返回新码，扫码成功后 LoggedIn 变 true。
+// 若另一个 goroutine 正在抓码（例如 EnsureLogin 正在跑），本次会立即返回空状态
+// （LoggedIn=false、无二维码），下次轮询即可拿到，不会阻塞。
+func (c *Client) QRStatus() (*LoginStatus, error) {
+	if !c.mu.TryLock() {
+		return &LoginStatus{}, nil
+	}
+	defer c.mu.Unlock()
+
+	if err := c.connectWithBackoffLocked(); err != nil {
+		return nil, err
+	}
+	if c.loggedInLocked() {
+		return &LoginStatus{LoggedIn: true}, nil
+	}
+	// 未登录：90 秒内的缓存直接复用，避免每次轮询都重新截图
+	if c.lastQR != nil && time.Since(c.lastQR.CapturedAt) < qrCacheTTL {
+		return statusFromQR(c.lastQR), nil
+	}
+	qr, err := c.fetchQRLocked()
+	if err != nil {
+		if c.lastQR != nil { // 抓不到新码就退回旧码，前端至少还有图可显示
+			return statusFromQR(c.lastQR), nil
+		}
+		return nil, err
+	}
+	c.lastQR = qr
+	return statusFromQR(qr), nil
+}
+
+func statusFromQR(qr *QRCode) *LoginStatus {
+	t := qr.CapturedAt
+	return &LoginStatus{
+		QRBase64:   qr.Base64,
+		DataURL:    qr.DataURL,
+		CapturedAt: &t,
+	}
 }

@@ -51,6 +51,10 @@ type Client struct {
 	page    *rod.Page
 	closeFn func()
 	lastQR  *QRCode
+
+	// 启动失败退避：避免 HTTP 轮询（/qr）每 3 秒触发一次浏览器启动，失败后空转
+	bootAt  time.Time
+	bootErr error
 }
 
 // New 创建客户端（不会立刻启动浏览器；Connect/EnsureLogin 时才启动）
@@ -126,6 +130,24 @@ func (c *Client) connectLocked() error {
 	}
 	wait(3000)
 	c.lg.Log("浏览器就绪")
+	return nil
+}
+
+// connectWithBackoffLocked 与 connectLocked 相同，但启动失败后 10 秒内不再重试。
+// 前端每 3 秒轮询 /qr（QRStatus）时会走到这里：一次启动失败要十几秒，
+// 不设退避就会变成「失败→重试→再失败」的空转，CPU 和日志都受不了。
+func (c *Client) connectWithBackoffLocked() error {
+	if c.page != nil && pageAlive(c.page) {
+		return nil
+	}
+	if c.bootErr != nil && time.Since(c.bootAt) < 10*time.Second {
+		return c.bootErr
+	}
+	if err := c.connectLocked(); err != nil {
+		c.bootAt, c.bootErr = time.Now(), err
+		return err
+	}
+	c.bootAt, c.bootErr = time.Time{}, nil
 	return nil
 }
 
