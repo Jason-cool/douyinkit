@@ -1,6 +1,9 @@
 # 运行时数据（浏览器 profile、日志、会话状态等，含登录凭证/Cookies，禁止入库）
 douyinkit-data/
 
+# 本地备份（可能含 profile/cookie，禁止入库）
+备份/
+
 # 编译产物
 *.exe
 *.exe~

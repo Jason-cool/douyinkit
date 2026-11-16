@@ -156,6 +156,16 @@ func (c *Client) loggedInLocked() bool {
 	return hasAuthCookie(c.browser) && !loginPageShown(c.page)
 }
 
+// IsLoggedInCached 只读当前登录状态：不启动浏览器、不排队等锁。
+// 给 HTTP 轮询（/qr）用 —— IsLoggedIn 每次都 Connect 并抢锁，抓二维码时页面会被拖住。
+func (c *Client) IsLoggedInCached() bool {
+	if !c.mu.TryLock() {
+		return false // 正在抓二维码/处理会话，本次按未登录返回，前端稍后再问
+	}
+	defer c.mu.Unlock()
+	return c.loggedInLocked()
+}
+
 // EnsureLogin 确保已登录：已登录直接返回 nil；
 // 未登录则抓取二维码回调给 onQR（连同 Options.OnQR），之后持续监控：
 // 二维码自动刷新时会再次回调，直到扫码成功或 ctx 取消。
@@ -182,6 +192,16 @@ func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
 	}
 
 	qr, err := c.FetchQR()
+	if err != nil {
+		// 首次抓取失败通常是页面还在渲染/残留登录态，重试而不是直接退出（否则 HTTP 服务跟着挂）
+		for attempt := 2; attempt <= 3; attempt++ {
+			c.lg.Log("! 抓取二维码失败（第 %d 次）：%v，3 秒后重试 ...", attempt-1, err)
+			wait(3000)
+			if qr, err = c.FetchQR(); err == nil {
+				break
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("抓取登录二维码失败：%w", err)
 	}

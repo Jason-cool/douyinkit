@@ -6,6 +6,7 @@ package douyinkit
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -38,6 +39,33 @@ func clearProfileLocks(dir string) {
 	for _, name := range []string{"SingletonLock", "SingletonSocket", "SingletonCookie"} {
 		_ = os.Remove(filepath.Join(dir, name))
 	}
+}
+
+// killStaleChrome 杀掉仍占着本 profile 的上轮残留浏览器进程（全平台）。
+// Leakless(false) 下 Go 进程被强杀后浏览器会存活：旧进程占着单例套接字，
+// 新实例会把会话“移交”给旧进程后静默退出，launcher 读不到 debug url（报错内容为空）。
+// 删锁文件对活进程无效，必须杀进程；只匹配启动参数 --user-data-dir=本目录，不会误杀用户自己的浏览器。
+func killStaleChrome(dir string) {
+	if runtime.GOOS == "windows" {
+		killStaleChromeWindows(dir)
+		return
+	}
+	_ = exec.Command("pkill", "-9", "-f", "user-data-dir="+dir).Run()
+	time.Sleep(500 * time.Millisecond)
+}
+
+// killStaleChromeWindows Windows 版：命令行里包含本 profile 目录的 chrome/msedge 才杀，
+// 不碰用户自己开着的浏览器。目录通过环境变量传入，避免中文路径在命令行里的转义问题。
+// （v3.1 之前 Windows 直接跳过清理，导致本地残留浏览器后每次启动都报
+// "Failed to get the debug url: exit status 1"，只能手动杀进程。）
+func killStaleChromeWindows(dir string) {
+	script := "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" | " +
+		"Where-Object { $_.CommandLine -and $_.CommandLine -like (\"*\" + $env:DY_PROFILE_DIR + \"*\") } | " +
+		"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	cmd.Env = append(os.Environ(), "DY_PROFILE_DIR="+dir)
+	_ = cmd.Run()
+	time.Sleep(500 * time.Millisecond)
 }
 
 func historyPath(base string) string { return filepath.Join(base, "state", "replied.json") }
@@ -99,12 +127,11 @@ func pickChrome(channel string) (string, error) {
 	return "", fmt.Errorf("没找到 %s 对应的浏览器，请安装 chromium 或改用 -channel auto/bundled", channel)
 }
 
-// openPage 打开 douyin.com/chat。headless=true 用于 Linux 服务器（无窗口）；
-// headless=false 用于本地调试（弹窗口）。会话保存在 BaseDir/session/profile。
-func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, func(), error) {
+// newLauncher 组装 launcher 配置（openPage 首次启动与重试共用）
+func newLauncher(channel, base string, headless bool) (*launcher.Launcher, error) {
 	bin, err := pickChrome(channel)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	// Leakless(false)：Windows Defender 会把 leakless.exe 误报为病毒导致启动失败；
 	// Linux 上无影响，统一关闭。代价：Go 进程被强杀时浏览器可能残留，正常退出不受影响。
@@ -124,9 +151,28 @@ func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, fun
 	if bin != "" {
 		l = l.Bin(bin)
 	}
-	// 启动前清理上次残留的单例锁，避免“profile 正被占用”启动失败
+	return l, nil
+}
+
+// openPage 打开 douyin.com/chat。headless=true 用于 Linux 服务器（无窗口）；
+// headless=false 用于本地调试（弹窗口）。会话保存在 BaseDir/session/profile。
+func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, func(), error) {
+	l, err := newLauncher(channel, base, headless)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// 启动前清理上次残留的单例锁、杀掉占着 profile 的残留进程，避免“profile 正被占用”启动失败
 	clearProfileLocks(profileDir(base))
+	killStaleChrome(profileDir(base))
 	u, err := l.Launch()
+	if err != nil {
+		// 重试一次：再杀残留进程 + 清锁后重启（应对旧进程刚在释放套接字的情况）
+		if l2, e2 := newLauncher(channel, base, headless); e2 == nil {
+			killStaleChrome(profileDir(base))
+			clearProfileLocks(profileDir(base))
+			u, err = l2.Launch()
+		}
+	}
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("启动浏览器失败：%w（如果另一个实例正在运行，请先关闭它）", err)
 	}

@@ -67,7 +67,8 @@ func main() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/qr", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			out := map[string]any{"logged_in": c.IsLoggedIn()}
+			w.Header().Set("Cache-Control", "no-store")
+			out := map[string]any{"logged_in": c.IsLoggedInCached()}
 			if qr, ok := c.LatestQR(); ok {
 				out["qr_base64"] = qr.Base64
 				out["data_url"] = qr.DataURL
@@ -80,18 +81,29 @@ func main() {
 			fmt.Fprint(w, `<!doctype html><meta charset="utf-8">
 <title>抖音扫码登录</title>
 <style>body{font-family:system-ui;background:#161823;color:#eee;text-align:center;padding-top:40px}
-img{width:260px;height:260px;background:#fff;padding:12px;border-radius:12px}
-p{color:#aaa}</style>
+img{width:260px;height:260px;background:#fff;padding:12px;border-radius:12px;object-fit:contain}
+p{color:#aaa;min-height:1.4em}</style>
 <h2>抖音扫码登录</h2>
-<img id="qr" alt="等待二维码...">
+<img id="qr" alt="正在获取二维码...">
+<p id="tip">正在获取二维码，请稍候…</p>
 <p>二维码每 3 秒自动刷新；用「抖音 APP」左上角扫一扫</p>
 <script>
+let n = 0;
 async function tick(){
+  const img = document.getElementById('qr'), tip = document.getElementById('tip');
   try{
-    const j = await (await fetch('/qr')).json();
-    if(j.data_url) document.getElementById('qr').src = j.data_url;
+    const j = await (await fetch('/qr', {cache:'no-store'})).json();
     if(j.logged_in){ document.body.innerHTML = '<h2>✅ 登录成功，可以关掉本页</h2>'; return; }
-  }catch(e){}
+    if(j.data_url && img.getAttribute('src') !== j.data_url){
+      img.src = j.data_url;
+      tip.textContent = '二维码已就绪，请用抖音 APP 扫码';
+    } else if(!j.data_url){
+      n++;
+      tip.textContent = '正在获取二维码…（第 ' + n + ' 次，程序在重置页面/等待登录框）';
+    }
+  }catch(e){
+    tip.textContent = '连接不上服务，正在重试…（确认程序还在运行）';
+  }
   setTimeout(tick, 3000);
 }
 tick();
@@ -107,12 +119,25 @@ tick();
 
 	// ---- 2) 登录：未登录则推二维码 ----
 	fmt.Println("等待登录（未登录会自动抓取二维码，通过 /qr 接口或页面展示）...")
-	if err := c.EnsureLogin(ctx, func(qr *douyinkit.QRCode) {
-		fmt.Printf("【二维码】已更新（%s），可访问 %s/qr 获取 base64，或打开页面扫码\n",
-			qr.CapturedAt.Format("15:04:05"), *addr)
-	}); err != nil {
-		fmt.Println("登录流程结束：", err)
-		os.Exit(1)
+	for {
+		err := c.EnsureLogin(ctx, func(qr *douyinkit.QRCode) {
+			fmt.Printf("【二维码】已更新（%s），可访问 %s/qr 获取 base64，或打开页面扫码\n",
+				qr.CapturedAt.Format("15:04:05"), *addr)
+		})
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			fmt.Println("已取消，退出")
+			os.Exit(1)
+		}
+		// 不直接退出：一次抓码失败（页面未渲染完/网络抖动）不该让 HTTP 服务和常驻进程一起挂掉
+		fmt.Println("登录流程出错：", err, "—— 10 秒后重新尝试（二维码服务保持可用）")
+		select {
+		case <-ctx.Done():
+			os.Exit(1)
+		case <-time.After(10 * time.Second):
+		}
 	}
 
 	// ---- 3) 业务：干跑一轮 / 定向单个会话 / 持续自动回复 ----
