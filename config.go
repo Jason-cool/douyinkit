@@ -25,6 +25,9 @@ type Config struct {
 	CheckRecentConvs      bool      `json:"check_recent_convs"` // 对「刚刚/N分钟前」的会话主动核对
 	AutoReply             bool      `json:"auto_reply"`         // 自动回复总开关；false = 该账号只观察/截图，不发送
 
+	// 命中屏蔽词就跳过：垃圾/骚扰/无关消息不自动回复（子串匹配，任一命中即跳过）
+	SkipKeywords []string `json:"skip_keywords"`
+
 	// 二次消息跟进：自动回复过一次之后，客户再发消息 → 只截图、不再回复
 	FollowUpScreenshot bool    `json:"followup_screenshot"`  // 是否给客户的二次消息截图
 	FollowUpNoReply    bool    `json:"followup_no_reply"`    // 二次消息不再自动回复
@@ -47,6 +50,9 @@ func (c *Config) clone() *Config {
 	if c.TypingDelaySeconds != nil {
 		cp.TypingDelaySeconds = append([]float64(nil), c.TypingDelaySeconds...)
 	}
+	if c.SkipKeywords != nil {
+		cp.SkipKeywords = append([]string(nil), c.SkipKeywords...)
+	}
 	return &cp
 }
 
@@ -65,6 +71,7 @@ func defaultConfig() *Config {
 		FollowUpScreenshot:    true,
 		FollowUpNoReply:       true,
 		FollowUpWatchHours:    0,
+		SkipKeywords:          []string{},
 	}
 }
 

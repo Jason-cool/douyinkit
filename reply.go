@@ -543,6 +543,21 @@ func looksLikeGroup(c ConvItem) bool {
 	return false
 }
 
+// containsSkipKeyword 消息文本里含有任一屏蔽词就返回 (命中的词, true)。
+// 子串匹配，用于过滤垃圾/骚扰/无关消息（如「借钱」「处对象吗」），命中则不自动回复。
+func containsSkipKeyword(text string, keywords []string) (string, bool) {
+	if text == "" || len(keywords) == 0 {
+		return "", false
+	}
+	for _, k := range keywords {
+		k = strings.TrimSpace(k)
+		if k != "" && strings.Contains(text, k) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 // freshConvPos 按名字重新查一次列表，拿会话的当前坐标。
 // 扫描时的坐标可能因列表重排/刷新而失效（点击落空、会话没选中），点击前必须取新坐标。
 func freshConvPos(page *rod.Page, name string) *ConvItem {
@@ -622,8 +637,16 @@ func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[str
 	}
 
 	// 判据：最后一条是不是对方发的。是 → 回；否 → 已在等对方，跳过
-	if last := evalLastMsg(page); last != nil && last.Side == "right" && cfg.SkipIfLastMsgIsMine {
+	last := evalLastMsg(page)
+	if last != nil && last.Side == "right" && cfg.SkipIfLastMsgIsMine {
 		return fmt.Sprintf("最后一条是我方发言，跳过（%q，截图 %s）", truncate(last.Text, 16), failShot(page, base, name, "lastmine"))
+	}
+
+	// 命中屏蔽词（垃圾/骚扰/无关消息）→ 不回复。以会话内最后一条真实消息为准（列表预览可能被截断）
+	if last != nil {
+		if kw, hit := containsSkipKeyword(last.Text, cfg.SkipKeywords); hit {
+			return fmt.Sprintf("命中屏蔽词「%s」，跳过（%q，截图 %s）", kw, truncate(last.Text, 16), failShot(page, base, name, "keyword"))
+		}
 	}
 
 	pos := evalInput(page)
@@ -815,6 +838,11 @@ func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist m
 		key := c.Name
 		if !cooldownOK(hist, key, cfg.SameUserCooldownHours) {
 			lg.Log("  冷却中，跳过：%s", truncate(key, 20))
+			continue
+		}
+		// 预览命中屏蔽词（垃圾/骚扰/无关消息）→ 直接跳过，不点开、不回复
+		if kw, hit := containsSkipKeyword(c.Preview, cfg.SkipKeywords); hit {
+			lg.Log("  预览命中屏蔽词「%s」，跳过：%s", kw, truncate(key, 20))
 			continue
 		}
 		// 已经自动回复过一次：客户再来消息不再回复（有新消息时由扫描阶段截图）
