@@ -66,6 +66,10 @@ type Client struct {
 	// 预热去重：Preheat 异步跑，多个 goroutine 同时调只跑一次
 	preheatMu  sync.Mutex
 	preheating bool
+
+	// 二维码接口里「检测到登录 cookie 但进不了私信页」的起始时间。
+	// 过期 sessionid 赖着不走时用它判定是否该清 cookie 重出码（>90 秒）。
+	authPendingAt time.Time
 }
 
 // New 创建客户端（不会立刻启动浏览器；Connect/EnsureLogin 时才启动）

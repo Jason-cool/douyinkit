@@ -269,12 +269,24 @@ type LoginStatus struct {
 	QRBase64   string     `json:"qr_base64,omitempty"` // 纯 base64（PNG 字节）
 	DataURL    string     `json:"data_url,omitempty"`  // data:image/png;base64,...
 	CapturedAt *time.Time `json:"captured_at,omitempty"`
+
+	// 浏览器正忙着（正在启动 / 正在抓码 / 正在确认登录态），本次没拿到二维码。
+	// 前端据此显示「正在准备中，请稍候」，而不是把空状态当成故障一直问。
+	Busy  bool   `json:"busy,omitempty"`
+	Stage string `json:"stage,omitempty"` // booting / fetching / logging_in / reset
 }
 
 // Text 可直接展示的中文状态
 func (s LoginStatus) Text() string {
-	if s.LoggedIn {
+	switch {
+	case s.LoggedIn:
 		return "已登录"
+	case s.Stage == "logging_in":
+		return "已检测到登录状态，正在确认（请稍候，勿关闭页面）"
+	case s.Stage == "reset":
+		return "登录态失效，正在重新获取二维码"
+	case s.Busy || s.Stage != "":
+		return "程序正在启动浏览器并获取二维码（首次约 20~30 秒），请稍候"
 	}
 	return "未登录，请用抖音 App 扫码"
 }
@@ -303,7 +315,9 @@ const qrCacheTTL = 90 * time.Second
 // （LoggedIn=false、无二维码），下次轮询即可拿到，不会阻塞。
 func (c *Client) QRStatus() (*LoginStatus, error) {
 	if !c.mu.TryLock() {
-		return &LoginStatus{}, nil
+		// 浏览器正被别的流程占用（首次启动 / EnsureLogin 正在抓码 / 正在处理会话）。
+		// 明确告诉前端「在忙」，否则前端只会无限显示「正在获取二维码…」。
+		return &LoginStatus{Busy: true, Stage: "fetching"}, nil
 	}
 	defer c.mu.Unlock()
 
@@ -311,6 +325,7 @@ func (c *Client) QRStatus() (*LoginStatus, error) {
 		return nil, err
 	}
 	if c.loggedInLocked() {
+		c.authPendingAt = time.Time{}
 		return &LoginStatus{LoggedIn: true}, nil
 	}
 	// 未登录：90 秒内的缓存直接复用，避免每次轮询都重新截图
@@ -320,15 +335,28 @@ func (c *Client) QRStatus() (*LoginStatus, error) {
 	qr, err := c.fetchQRLocked()
 	if err != nil {
 		if errors.Is(err, errAuthPending) {
-			// 正在登录（cookie 已到、页面还在跳转）：给前端一个空状态，下次轮询再问，
+			// 正在登录（cookie 已到、页面还在跳转）：给前端一个「确认中」状态，下次轮询再问，
 			// 不要报错 —— 报错会让前端弹「获取二维码失败」，而实际上用户已经扫成功了。
-			return &LoginStatus{}, nil
+			// 但如果是「过期 sessionid 赖着不走」，这里会永远等不到登录页 —— 超过 90 秒就清干净重出码。
+			if c.authPendingAt.IsZero() {
+				c.authPendingAt = time.Now()
+				return &LoginStatus{Busy: true, Stage: "logging_in"}, nil
+			}
+			if time.Since(c.authPendingAt) > 90*time.Second {
+				c.lg.Log("登录 cookie 长期无法进入私信页（>90 秒，疑似已失效），清除后重新出码 ...")
+				c.authPendingAt = time.Time{}
+				c.lastQR = nil
+				c.resetGuestLocked()
+				return &LoginStatus{Busy: true, Stage: "reset"}, nil
+			}
+			return &LoginStatus{Busy: true, Stage: "logging_in"}, nil
 		}
 		if c.lastQR != nil { // 抓不到新码就退回旧码，前端至少还有图可显示
 			return statusFromQR(c.lastQR), nil
 		}
 		return nil, err
 	}
+	c.authPendingAt = time.Time{}
 	c.lastQR = qr
 	return statusFromQR(qr), nil
 }

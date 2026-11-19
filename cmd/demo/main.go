@@ -133,7 +133,7 @@ func main() {
 img{width:260px;height:260px;background:#fff;padding:12px;border-radius:12px;object-fit:contain}
 p{color:#aaa;min-height:1.4em}</style>
 <h2>抖音扫码登录</h2>
-<img id="qr" alt="正在获取二维码...">
+<img id="qr" alt="" style="display:none">
 <p id="tip">正在获取二维码，请稍候…</p>
 <p>二维码每 3 秒自动刷新；用「抖音 APP」左上角扫一扫</p>
 <script>
@@ -143,12 +143,18 @@ async function tick(){
   try{
     const j = await (await fetch('/qr', {cache:'no-store'})).json();
     if(j.logged_in){ document.body.innerHTML = '<h2>✅ 登录成功，可以关掉本页</h2>'; return; }
-    if(j.data_url && img.getAttribute('src') !== j.data_url){
-      img.src = j.data_url;
+    if(j.data_url){
+      if(img.getAttribute('src') !== j.data_url){ img.src = j.data_url; }
+      img.style.display = 'inline-block';
       tip.textContent = '二维码已就绪，请用抖音 APP 扫码';
-    } else if(!j.data_url){
+    } else {
+      img.style.display = 'none';
       n++;
-      tip.textContent = '正在获取二维码…（第 ' + n + ' 次，程序在重置页面/等待登录框）';
+      // 服务端明确告知阶段，别让用户对着「正在获取」无限等
+      if(j.stage === 'logging_in'){ tip.textContent = '已检测到登录状态，正在确认（请稍候，勿关闭页面）…'; }
+      else if(j.stage === 'reset'){ tip.textContent = '登录态已失效，正在重新获取二维码…'; }
+      else if(j.stage === 'fetching'){ tip.textContent = '程序正在启动浏览器并抓取二维码（首次约 20~30 秒）…（第 ' + n + ' 次）'; }
+      else { tip.textContent = '正在获取二维码…（第 ' + n + ' 次，程序在重置页面/等待登录框）'; }
     }
   }catch(e){
     tip.textContent = '连接不上服务，正在重试…（确认程序还在运行）';
