@@ -214,7 +214,7 @@ func (c *Client) connectLocked() error {
 		c.closeFn, c.page, c.browser = nil, nil, nil
 	}
 	c.lg.Log("启动浏览器（headless=%v）...", c.headless)
-	b, page, closeFn, err := openPage(c.opt.Channel, c.base, c.headless)
+	b, page, closeFn, err := openPage(c.opt.Channel, c.base, c.headless, c.lg.Log)
 	if err != nil {
 		return err
 	}

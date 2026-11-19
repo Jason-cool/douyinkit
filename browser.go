@@ -4,6 +4,7 @@ package douyinkit
 // Windows/macOS 本地调试时有显示器路径可选。逻辑复刻 Windows 版 browser.go。
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -178,9 +179,21 @@ func newLauncher(channel, base string, headless bool) (*launcher.Launcher, error
 	return l, nil
 }
 
+// 浏览器各启动步骤的超时。之前没有超时：任一步卡住（DevTools 连不上 / 私信页
+// load 事件不来）就会永远停在「启动浏览器 ...」一行，进程看着活着其实在空转。
+const (
+	stepLaunchTimeout   = 90 * time.Second // chromium 进程起来并给出调试端口
+	stepConnectTimeout  = 60 * time.Second // CDP 连接
+	stepNavigateTimeout = 90 * time.Second // 打开私信页（服务器上风控/网络慢是常态，给足余量）
+)
+
 // openPage 打开 douyin.com/chat。headless=true 用于 Linux 服务器（无窗口）；
 // headless=false 用于本地调试（弹窗口）。会话保存在 BaseDir/session/profile。
-func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, func(), error) {
+// 每一步都带超时并打日志：卡住时能看到具体停在哪一步，而不是一行「启动浏览器」挂死。
+func openPage(channel, base string, headless bool, logf func(format string, args ...any)) (*rod.Browser, *rod.Page, func(), error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	l, err := newLauncher(channel, base, headless)
 	if err != nil {
 		return nil, nil, nil, err
@@ -188,7 +201,26 @@ func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, fun
 	// 启动前清理上次残留的单例锁、杀掉占着 profile 的残留进程，避免“profile 正被占用”启动失败
 	clearProfileLocks(profileDir(base))
 	killStaleChrome(profileDir(base))
-	u, err := l.Launch()
+
+	// Launch 同样可能挂死（chromium 起了却一直不吐调试端口，典型原因是 profile 被活进程占用）。
+	// 包一层超时：到点杀掉残留进程并报错，让上层走重连/退避，而不是一行日志挂到天荒地老。
+	type launchRes struct {
+		url string
+		err error
+	}
+	launchCh := make(chan launchRes, 1)
+	go func() {
+		u, err := l.Launch()
+		launchCh <- launchRes{u, err}
+	}()
+	var u string
+	select {
+	case r := <-launchCh:
+		u, err = r.url, r.err
+	case <-time.After(stepLaunchTimeout):
+		killStaleChrome(profileDir(base))
+		return nil, nil, nil, fmt.Errorf("启动浏览器进程超时（%v）：chromium 一直没给出调试端口（常见原因：profile 被另一个活着的浏览器实例占用），已清理残留进程", stepLaunchTimeout)
+	}
 	if err != nil {
 		// 重试一次：再杀残留进程 + 清锁后重启（应对旧进程刚在释放套接字的情况）
 		if l2, e2 := newLauncher(channel, base, headless); e2 == nil {
@@ -198,20 +230,37 @@ func openPage(channel, base string, headless bool) (*rod.Browser, *rod.Page, fun
 		}
 	}
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("启动浏览器失败：%w（如果另一个实例正在运行，请先关闭它）", err)
+		return nil, nil, nil, fmt.Errorf("启动浏览器进程失败：%w（如果另一个实例正在运行，请先关闭它）", err)
 	}
+	logf("浏览器进程已启动，连接 DevTools ...")
 	b := rod.New().ControlURL(u)
-	if err := b.Connect(); err != nil {
-		return nil, nil, nil, fmt.Errorf("连接浏览器失败：%w", err)
+	// Connect 没有自带超时：端口被防火墙吞/进程假死时会永远等。
+	// 不能用 b.Timeout()（会给整个浏览器会话设死限），用并行等待的方式只限「连接」这一步。
+	connDone := make(chan error, 1)
+	go func() { connDone <- b.Connect() }()
+	select {
+	case err := <-connDone:
+		if err != nil {
+			_ = b.Close()
+			return nil, nil, nil, fmt.Errorf("连接浏览器 DevTools 失败：%w", err)
+		}
+	case <-time.After(stepConnectTimeout):
+		_ = b.Close()
+		killStaleChrome(profileDir(base))
+		return nil, nil, nil, fmt.Errorf("连接浏览器 DevTools 超时（%v）：chromium 可能没起来或端口不通，已清理残留进程，请重试", stepConnectTimeout)
 	}
 	page, err := b.Page(proto.TargetCreateTarget{})
 	if err != nil {
 		_ = b.Close()
 		return nil, nil, nil, fmt.Errorf("新建页面失败：%w", err)
 	}
-	if err := page.Navigate(chatURL); err != nil {
-		_ = b.Close()
-		return nil, nil, nil, fmt.Errorf("打开私信页失败：%w", err)
+	// Navigate 等的是 load 事件：网络/风控把请求挂住时它永远不来，不设超时
+	// 整个进程就会停在「启动浏览器 ...」。超时不算致命——页面可能只是慢，
+	// 后续登录/二维码流程自己会继续等渲染。
+	navCtx, navCancel := context.WithTimeout(context.Background(), stepNavigateTimeout)
+	defer navCancel()
+	if err := page.Context(navCtx).Navigate(chatURL); err != nil {
+		logf("! 私信页 %v 内没有加载完（网络慢或被风控拦截），先继续登录流程", stepNavigateTimeout)
 	}
 	return b, page, func() { _ = b.Close() }, nil
 }
