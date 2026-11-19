@@ -320,6 +320,18 @@ func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
 	}
 
 	qr, err := c.FetchQR()
+	if errors.Is(err, errAuthPending) {
+		// 刚扫码/已有有效 cookie：按登录成功收尾，绝不重新抓码
+		//（重抓一旦扑空就会触发清 cookie，把刚建立的登录态抹掉）
+		c.lg.Log("检测到登录 cookie，等待页面切换（不重新抓码、不清 cookie）...")
+		if c.settleLogin(45 * time.Second) {
+			c.lg.Log("检测到登录成功！会话已保存到 session/profile")
+			return nil
+		}
+		c.lg.Log("登录 cookie 无法进入私信页（可能已失效），清理后重新出码 ...")
+		c.forceResetGuest()
+		qr, err = c.FetchQR()
+	}
 	if err != nil {
 		// 首次抓取失败通常是页面还在渲染/残留登录态，重试而不是直接退出（否则 HTTP 服务跟着挂）
 		for attempt := 2; attempt <= 3; attempt++ {
@@ -343,6 +355,9 @@ func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
 		qrRefresh = 30 * time.Second
 	}
 	nextRefresh := time.Now().Add(qrRefresh)
+	// 扫码后 cookie 已到、登录浮层还没消失时的收尾尝试计数（跳转慢，别无限重试）
+	settleTries := 0
+	lastSettle := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -350,6 +365,7 @@ func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
 		case <-ticker.C:
 			c.mu.Lock()
 			logged := c.loggedInLocked()
+			authCooked := c.browser != nil && hasAuthCookie(c.browser)
 			c.mu.Unlock()
 			if logged {
 				c.lg.Log("检测到登录成功！会话已保存到 session/profile")
@@ -360,6 +376,19 @@ func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
 				c.mu.Unlock()
 				c.waitForConvs(30 * time.Second)
 				return nil
+			}
+			// 已拿到登录 cookie，但页面仍停在登录浮层（扫码成功后跳转慢/浮层没关）：
+			// 主动切到私信页确认。不这样的话就会「用户明明扫码点了登录，程序一直说没登录」。
+			if authCooked && settleTries < 5 && time.Since(lastSettle) > 8*time.Second {
+				settleTries++
+				lastSettle = time.Now()
+				if settleTries == 1 {
+					c.lg.Log("检测到登录 cookie，但页面还停在登录态，切换私信页确认登录 ...")
+				}
+				if c.settleLogin(15 * time.Second) {
+					c.lg.Log("检测到登录成功！会话已保存到 session/profile")
+					return nil
+				}
 			}
 			if time.Now().After(nextRefresh) {
 				if qr2, e := c.FetchQR(); e == nil {
