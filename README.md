@@ -281,6 +281,7 @@ setInterval(async () => {
 | `cmd/autoreply` | **只设置自动回复开关**：改 config.json，不启动浏览器 | `go run ./cmd/autoreply -off`（关）/ `-on`（开）/ 不带参查看 |
 | `cmd/followups` | **只看/管理二次消息观察名单**：不启动浏览器 | `go run ./cmd/followups`；解除观察 `go run ./cmd/followups -unwatch 昵称` |
 | `cmd/gate` | **是否启动 Run 的开关演示**：闸门关不轮询，运行中可开/关/启/停 | `go run ./cmd/gate -no-reply`；接口 `/status` `/toggle` `/start` `/stop` `/qr` |
+| `cmd/preheat` | **只预热（常驻模式）**：后台启动浏览器+预取二维码，进程保活 | `go run ./cmd/preheat`；带观察接口 `go run ./cmd/preheat -addr :6063` |
 
 多账号统一加 `-account 账号名`（数据目录变为 `<base>/<账号名>`），例如：
 
@@ -292,7 +293,34 @@ go run ./cmd/followups -account 店铺A        # 看店铺A的观察名单
 
 对应库方法：login→`Connect/EnsureLogin`，qr→`QRStatus`，reply→`RunOnce/Run/SendTo`，
 autoreply→`Options.AutoReply/Config.AutoReply`（运行中切换用 `SetAutoReply`），
-followups→`FollowUps/Unwatch`，gate→`Run` 的启动时机 + `SetAutoReply` 运行中切换。
+followups→`FollowUps/Unwatch`，gate→`Run` 的启动时机 + `SetAutoReply` 运行中切换，
+preheat→`Client.Preheat/Manager.Preheat/Manager.PreheatAll`。
+
+### Preheat：常驻 + 预热（服务器扫码慢的方案 B）
+
+原理：把「浏览器冷启动 + 登录页加载 + 风控挑战」提前到用户扫码**之前**，
+用户要扫码时二维码已经抓好，秒出。已登录账号浏览器常驻内存，不再反复冷启动。
+
+```go
+// 单账号：创建后预热一行搞定（异步，失败不影响主流程）
+c, _ := douyinkit.New(opt)
+c.Preheat()
+
+// 多账号：模板开 Preheat，新账号创建即自动后台预热
+m, _ := douyinkit.NewManager("/data/douyin", douyinkit.Options{Preheat: true})
+c1, _ := m.Account("shop1")   // 创建即预热
+m.Preheat("shop1")            // 也可手动预热 / m.PreheatAll() 全量预热
+```
+
+命令行加 `-preheat` 即可（`cmd/demo` / `cmd/gate`），不加则行为与之前完全一致：
+
+```bash
+./douyinkit-demo-linux-amd64 -preheat -send -loop -base /var/lib/douyin
+```
+
+注意：每个常驻浏览器约占 300~500MB 内存；不活跃账号可 `Close()` 释放，
+登录态在磁盘 profile 里，下次预热/使用免扫码。
+
 
 ---
 

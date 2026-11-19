@@ -41,6 +41,7 @@ func main() {
 	send := flag.Bool("send", false, "真正发送（默认干跑，只打印会回谁）")
 	noReply := flag.Bool("no-reply", false, "启动时就把自动回复关掉（演示「不启动 Run」）")
 	addr := flag.String("addr", ":6062", "控制接口监听地址")
+	preheat := flag.Bool("preheat", false, "启动即后台预热（常驻模式）：提前启动浏览器+预取登录二维码")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -66,6 +67,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer c.Close()
+
+	// 可选：常驻预热（异步；冷启动成本挪到扫码/Run 之前）
+	if *preheat {
+		c.Preheat()
+		fmt.Println("已开始后台预热（启动浏览器 + 预取登录二维码）...")
+	}
 
 	// 未登录先扫码，否则 Run 也会因为页面不对而空转
 	if !c.IsLoggedIn() {

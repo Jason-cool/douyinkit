@@ -21,6 +21,10 @@ package douyinkit
 //	c1.Run(ctx, false)
 //
 // 注意：每个账号会启动一个独立浏览器进程，机器内存要够（每个约 300~500MB）。
+//
+// 常驻+预热（CentOS 扫码慢的方案 B）：模板里传 Preheat: true，
+// 新账号创建即后台预热（启动浏览器 + 预取登录二维码），用户扫码时秒出码；
+// 也可手动 m.Preheat("shop1") / m.PreheatAll()。
 
 import (
 	"fmt"
@@ -110,6 +114,33 @@ func (m *Manager) Names() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Preheat 预热指定账号（常驻模式）：后台启动浏览器并预取登录二维码，
+// 之后的扫码/轮询不再经历冷启动。异步立即返回；账号不存在返回 false。
+func (m *Manager) Preheat(name string) bool {
+	m.mu.Lock()
+	c, ok := m.accs[name]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	c.Preheat()
+	return true
+}
+
+// PreheatAll 预热所有已创建账号（异步，立即返回）。
+// 每个账号一个独立浏览器进程，全部预热常驻约占 300~500MB/账号 内存，按需使用。
+func (m *Manager) PreheatAll() {
+	m.mu.Lock()
+	accs := make([]*Client, 0, len(m.accs))
+	for _, c := range m.accs {
+		accs = append(accs, c)
+	}
+	m.mu.Unlock()
+	for _, c := range accs {
+		c.Preheat()
+	}
 }
 
 // Close 关闭指定账号的浏览器（账号数据保留，下次 Account(name) 可继续用）。

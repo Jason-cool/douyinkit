@@ -14,6 +14,7 @@
 //	go run ./cmd/demo -send -loop      # 持续自动回复
 //	go run ./cmd/demo -base /data/dy   # 指定数据目录
 //	go run ./cmd/demo -account shop1 -no-reply   # 指定账号 + 关闭自动回复（只截图/观察）
+//	go run ./cmd/demo -preheat -loop             # 常驻+预热：启动即备好浏览器和二维码（服务器推荐）
 package main
 
 import (
@@ -40,6 +41,7 @@ func main() {
 	noReply := flag.Bool("no-reply", false, "关闭该账号的自动回复（只做二次消息截图/观察，不发送任何消息）")
 	noHeadless := flag.Bool("no-headless", false, "弹浏览器窗口（本地调试用；Linux 服务器默认无头）")
 	forceHeadless := flag.Bool("headless", false, "强制无头模式（在 Windows 上模拟 Linux 服务器环境）")
+	preheat := flag.Bool("preheat", false, "启动即后台预热（常驻模式）：提前启动浏览器+预取登录二维码，扫码时秒出")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -92,6 +94,12 @@ func main() {
 		}
 	}
 	defer c.Close()
+
+	// ---- 0) 可选：常驻预热（异步，不阻塞登录/HTTP 流程；冷启动成本挪到扫码之前） ----
+	if *preheat {
+		c.Preheat()
+		fmt.Println("已开始后台预热（启动浏览器 + 预取登录二维码）...")
+	}
 
 	// ---- 1) HTTP 服务：把二维码给到前端 ----
 	if *addr != "" {

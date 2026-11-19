@@ -40,6 +40,7 @@ type Options struct {
 	Account   string  // 账号名：日志前缀；用 Manager 管理多账号时会自动填写
 	Config    *Config // 配置传参（推荐 douyinkit.DefaultConfig() 改好传入）；nil → 读 BaseDir/config.json，没有则默认值
 	AutoReply *bool   // 该账号是否自动回复；nil = 不覆盖。false 时只做二次消息截图/观察，不发送任何消息
+	Preheat   bool    // 创建后自动后台预热（常驻模式）：提前启动浏览器并预取登录二维码。也可手动调 Client.Preheat / Manager.Preheat
 }
 
 // Client 抖音私信助手客户端
@@ -61,6 +62,10 @@ type Client struct {
 	// 启动失败退避：避免 HTTP 轮询（/qr）每 3 秒触发一次浏览器启动，失败后空转
 	bootAt  time.Time
 	bootErr error
+
+	// 预热去重：Preheat 异步跑，多个 goroutine 同时调只跑一次
+	preheatMu  sync.Mutex
+	preheating bool
 }
 
 // New 创建客户端（不会立刻启动浏览器；Connect/EnsureLogin 时才启动）
@@ -122,7 +127,7 @@ func New(opt Options) (*Client, error) {
 			lg.Log("二次消息观察名单：从历史回复记录补入 %d 个会话（最近 %d 天）", n, followSeedDays)
 		}
 	}
-	return &Client{
+	c := &Client{
 		opt:      opt,
 		cfg:      cfg,
 		hist:     hist,
@@ -130,7 +135,66 @@ func New(opt Options) (*Client, error) {
 		lg:       lg,
 		base:     abs,
 		headless: headless,
-	}, nil
+	}
+	if opt.Preheat { // 显式开启常驻模式：创建即后台预热
+		c.Preheat()
+	}
+	return c, nil
+}
+
+// Preheat 后台预热（常驻模式，异步、立即返回、可重复调用）。
+//
+// 做两件事：
+//  1. 提前启动浏览器并打开私信页（Connect）；
+//  2. 未登录时提前抓好登录二维码放进缓存，之后的 QRStatus/EnsureLogin 秒级返回。
+//
+// 典型场景（CentOS 扫码慢）：服务一启动就预热，把「浏览器冷启动 + 登录页加载 +
+// 风控挑战」全部挪到用户扫码之前，用户要扫码时二维码已经是现成的。
+// 已登录的账号预热后浏览器常驻内存，后续轮询/发送不再经历冷启动。
+//
+// 预热失败不影响主流程：只打日志，主逻辑用到时按原有路径自动重试。
+// 与主逻辑并发安全：内部走同一把锁，主逻辑先到就先处理，预热本轮自动让路。
+func (c *Client) Preheat() {
+	c.preheatMu.Lock()
+	if c.preheating {
+		c.preheatMu.Unlock()
+		return
+	}
+	c.preheating = true
+	c.preheatMu.Unlock()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.lg.Log("! 预热异常（不影响主流程）：%v", r)
+			}
+			c.preheatMu.Lock()
+			c.preheating = false
+			c.preheatMu.Unlock()
+		}()
+		if err := c.preheat(); err != nil {
+			c.lg.Log("! 预热未完成（不影响主流程，用时自动重试）：%v", err)
+		}
+	}()
+}
+
+func (c *Client) preheat() error {
+	t0 := time.Now()
+	// QRStatus 内部：带退避的 Connect → 登录检测 → 未登录则抓码缓存（含骨架屏自愈）。
+	// 全程复用主逻辑的锁与状态，预热完的主逻辑零改动受益。
+	st, err := c.QRStatus()
+	if err != nil {
+		return err
+	}
+	d := time.Since(t0).Round(time.Second)
+	switch {
+	case st.LoggedIn:
+		c.lg.Log("预热完成（%v）：已有登录态，浏览器常驻就绪", d)
+	case st.DataURL != "":
+		c.lg.Log("预热完成（%v）：登录二维码已提前抓好，扫码时秒出", d)
+	default:
+		c.lg.Log("预热让路：主流程正在使用浏览器（本轮跳过，不影响任何操作）")
+	}
+	return nil
 }
 
 // Connect 启动（或复用）浏览器并打开私信页。已连接时是幂等的。
