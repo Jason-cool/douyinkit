@@ -21,7 +21,7 @@ services:
       # 登录态/日志/冷却记录持久化到宿主机，重建容器不丢登录
       - ./douyinkit-data:/app/douyinkit-data
 
-    # 持续自动回复（真实发送）。
+    # 持续自动回复（真实发送），-preheat 启动即后台预热（常驻：冷启动挪到扫码之前）。
     # 首次建议先干跑观察：去掉 "-send" 与 "-loop" 两行即可。
     command:
       - "-base"
@@ -30,5 +30,9 @@ services:
       - ":6060"
       - "-channel"
       - "chromium"
+      - "-preheat"
       - "-send"
       - "-loop"
+
+    # 每个账号一个浏览器实例约占 300~500MB，多账号多容器时记得给上限
+    # mem_limit: 1g

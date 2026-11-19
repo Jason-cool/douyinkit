@@ -56,6 +56,6 @@ EXPOSE 6060
 
 ENTRYPOINT ["/app/demo"]
 
-# 默认：走容器内 /usr/bin/chromium（-channel chromium），持续自动回复（真实发送）。
-# 想先干跑观察，去掉 "-send","-loop" 即可（见 docker-compose.yml）。
-CMD ["-base", "/app/douyinkit-data", "-addr", ":6060", "-channel", "chromium", "-send", "-loop"]
+# 默认：走容器内 /usr/bin/chromium（-channel chromium），启动即预热（常驻），
+# 持续自动回复（真实发送）。想先干跑观察，去掉 "-send","-loop" 即可（见 docker-compose.yml）。
+CMD ["-base", "/app/douyinkit-data", "-addr", ":6060", "-channel", "chromium", "-preheat", "-send", "-loop"]

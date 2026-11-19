@@ -13,7 +13,7 @@
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
-BRANCH="${BRANCH:-main}"
+BRANCH="${BRANCH:-master}"
 
 # ---- 1) 凭据 ----
 if [ -z "${GIT_USER:-}" ]; then read -r -p "Git 用户名: " GIT_USER; fi
