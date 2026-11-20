@@ -213,12 +213,43 @@ const SEND_BTN_JS = `
 }
 `
 
-const LOGIN_PAGE_JS = `
+const LOGIN_STATE_JS = `
 () => {
-  const t = document.body.innerText || '';
-  return t.includes('扫码登录') || t.includes('验证码登录') || t.includes('密码登录');
+  const visible = e => {
+    if (!e) return false;
+    const r = e.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    for (let p = e; p && p.nodeType === 1; p = p.parentElement) {
+      const s = getComputedStyle(p);
+      if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) return false;
+    }
+    return true;
+  };
+  const any = sel => [...document.querySelectorAll(sel)].some(visible);
+  const qrVisible = any('#douyin_login_comp_scan_code_qrcode, #animate_qrcode_container, [id*="scan_code_qrcode"]');
+  // Only look for login words inside a visible login component/dialog.
+  // A customer mentioning “扫码登录” in a chat message is not a login dialog.
+  const loginRoots = '#douyin_login_comp, #login-full-panel, [role="dialog"], ' +
+    '[data-e2e="login-dialog"], [class*="login-modal"], [class*="loginModal"], ' +
+    '[class*="LoginModal"], [class*="login-panel"], [class*="loginPanel"], [class*="LoginPanel"]';
+  const loginVisible = qrVisible || [...document.querySelectorAll(loginRoots)].some(e =>
+    visible(e) && /扫码登录|验证码登录|密码登录/.test(e.innerText || ''));
+  const verification = (` + smsVerificationStateJS + `)();
+  const verificationRequired = verification !== null;
+  const onChat = location.pathname === '/chat' || location.pathname.startsWith('/chat/');
+  const rows = any('div[class*="conversationConversationItemwrapper"], div[class*="conversationStrangerBoxwrapper"]');
+  const editor = any('div[class*="messageEditorinputArea"]');
+  const list = any('[class*="conversationConversationList"], [class*="conversationList"]');
+  const empty = [...document.querySelectorAll('main, [class*="conversation"], [class*="Conversation"]')]
+    .some(e => visible(e) && /^(暂无会话|暂无聊天|暂无私信|暂无消息|还没有消息)[。！!\s]*$/.test((e.innerText || '').trim()));
+  return { chat_ready: onChat && (rows || editor || (list && empty)),
+    login_visible: loginVisible || verificationRequired, qr_visible: qrVisible,
+    verification_required: verificationRequired, verification, page_url: location.origin + location.pathname,
+    document_ready: document.readyState };
 }
 `
+
+const LOGIN_PAGE_JS = `() => (` + LOGIN_STATE_JS + `)().login_visible`
 
 // ---------------------------------------------------------------- DOM 标记（替代坐标点击）
 //

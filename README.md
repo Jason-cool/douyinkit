@@ -493,3 +493,17 @@ A：`EnsureLogin` 5 秒轮询一次登录 cookie；若长时间不成功，看�
 **Q：想定向回复某个会话？**
 A：库里用 `RunOnce` 走全量扫描；定向回复请用 Windows 版的 `-to`，或基于本库自行扩展
 （`replyToNamed` 已保留在包内，未导出）。
+
+
+```bash
+# 服务器上（项目根目录，与 docker-compose.yml 同级）
+bash deploy.sh                    # 拉代码 + 重建 + 起容器 + 打日志
+
+# 或者手动：
+docker compose up -d --build
+docker compose logs -f            # 跟日志（调试期一直开着）
+
+# 停/重启（容器级清理，比 pkill 干净）
+docker compose down
+docker compose restart
+```

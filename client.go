@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -37,10 +38,11 @@ type Options struct {
 	OnFollowUp func(f FollowUp)                     // 自动回复过之后客户再来消息：截图完成回调（可为 nil）
 	QRRefresh  time.Duration                        // 等扫码期间二维码重抓周期，默认 30 秒
 
-	Account   string  // 账号名：日志前缀；用 Manager 管理多账号时会自动填写
-	Config    *Config // 配置传参（推荐 douyinkit.DefaultConfig() 改好传入）；nil → 读 BaseDir/config.json，没有则默认值
-	AutoReply *bool   // 该账号是否自动回复；nil = 不覆盖。false 时只做二次消息截图/观察，不发送任何消息
-	Preheat   bool    // 创建后自动后台预热（常驻模式）：提前启动浏览器并预取登录二维码。也可手动调 Client.Preheat / Manager.Preheat
+	Account        string  // 账号名：日志前缀；用 Manager 管理多账号时会自动填写
+	Config         *Config // 配置传参（推荐 douyinkit.DefaultConfig() 改好传入）；nil → 读 BaseDir/config.json，没有则默认值
+	AutoReply      *bool   // 该账号是否自动回复；nil = 不覆盖。false 时只做二次消息截图/观察，不发送任何消息
+	Preheat        bool    // 创建后自动后台预热（常驻模式）：提前启动浏览器并预取登录二维码。也可手动调 Client.Preheat / Manager.Preheat
+	AutoReceiveSMS bool    // 额外身份验证时自动选择一次“接收短信验证码”；重发始终需显式调用 SendSMSCode
 }
 
 // Client 抖音私信助手客户端
@@ -52,24 +54,36 @@ type Client struct {
 	lg       *Logger
 	base     string
 	headless bool
+	cfgMu    sync.RWMutex
 
 	mu      sync.Mutex
 	browser *rod.Browser
 	page    *rod.Page
 	closeFn func()
-	lastQR  *QRCode
+	// Snapshots have their own lock; HTTP reads never wait for browser work.
+	snapshotMu sync.RWMutex
+	lastQR     *QRCode
+	loggedIn   atomic.Bool
+	loginStage string
+	loginError string
+	// Guard the SSO transition after the QR disappears. No Cookie yet does
+	// not mean the browser is a guest or that its storage may be cleared.
+	loginHadQR          bool
+	loginUncertainSince time.Time
+	lastLoginRecovery   time.Time
+	verification        *SMSVerification // snapshotMu protects this snapshot
+	smsID               string
+	smsResendAt         time.Time
+	smsSubmittingUntil  time.Time
 
 	// 启动失败退避：避免 HTTP 轮询（/qr）每 3 秒触发一次浏览器启动，失败后空转
 	bootAt  time.Time
 	bootErr error
 
 	// 预热去重：Preheat 异步跑，多个 goroutine 同时调只跑一次
-	preheatMu  sync.Mutex
-	preheating bool
-
-	// 二维码接口里「检测到登录 cookie 但进不了私信页」的起始时间。
-	// 过期 sessionid 赖着不走时用它判定是否该清 cookie 重出码（>90 秒）。
-	authPendingAt time.Time
+	preheatMu     sync.Mutex
+	preheating    bool
+	preheatCancel context.CancelFunc
 }
 
 // New 创建客户端（不会立刻启动浏览器；Connect/EnsureLogin 时才启动）
@@ -95,6 +109,7 @@ func New(opt Options) (*Client, error) {
 		headless = *opt.Headless
 	}
 	lg := newLogger(abs)
+	lg.UserLog = opt.Logf
 	lg.Hook = opt.OnReply
 	lg.FollowHook = opt.OnFollowUp
 	// 多账号时给日志加账号前缀，方便区分不同账号的输出
@@ -165,27 +180,31 @@ func (c *Client) Preheat() {
 		return
 	}
 	c.preheating = true
+	ctx, cancel := context.WithCancel(context.Background())
+	c.preheatCancel = cancel
 	c.preheatMu.Unlock()
 	go func() {
+		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
 				c.lg.Log("! 预热异常（不影响主流程）：%v", r)
 			}
 			c.preheatMu.Lock()
 			c.preheating = false
+			c.preheatCancel = nil
 			c.preheatMu.Unlock()
 		}()
-		if err := c.preheat(); err != nil {
+		if err := c.preheat(ctx); err != nil && ctx.Err() == nil {
 			c.lg.Log("! 预热未完成（不影响主流程，用时自动重试）：%v", err)
 		}
 	}()
 }
 
-func (c *Client) preheat() error {
+func (c *Client) preheat(ctx context.Context) error {
 	t0 := time.Now()
 	// QRStatus 内部：带退避的 Connect → 登录检测 → 未登录则抓码缓存（含骨架屏自愈）。
 	// 全程复用主逻辑的锁与状态，预热完的主逻辑零改动受益。
-	st, err := c.QRStatus()
+	st, err := c.qrStatusContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -204,12 +223,18 @@ func (c *Client) preheat() error {
 // Connect 启动（或复用）浏览器并打开私信页。已连接时是幂等的。
 // 注意：未登录不算错误 —— 用 IsLoggedIn/EnsureLogin 处理登录。
 func (c *Client) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connectLocked()
+	return c.connectContext(context.Background())
 }
 
-func (c *Client) connectLocked() error {
+func (c *Client) connectContext(ctx context.Context) error {
+	if err := c.lockContext(ctx); err != nil {
+		return err
+	}
+	defer c.mu.Unlock()
+	return c.connectContextLocked(ctx)
+}
+
+func (c *Client) connectContextLocked(ctx context.Context) error {
 	if c.page != nil && pageAlive(c.page) {
 		return nil
 	}
@@ -218,42 +243,37 @@ func (c *Client) connectLocked() error {
 		c.closeFn, c.page, c.browser = nil, nil, nil
 	}
 	c.lg.Log("启动浏览器（headless=%v）...", c.headless)
-	b, page, closeFn, err := openPage(c.opt.Channel, c.base, c.headless, c.lg.Log)
+	started := time.Now()
+	c.loggedIn.Store(false)
+	c.loginHadQR = false
+	c.loginUncertainSince = time.Time{}
+	c.lastLoginRecovery = time.Time{}
+	c.clearVerificationLocked()
+	c.setLastQR(nil)
+	c.setLoginProgress("booting", nil)
+	b, page, closeFn, err := openPage(ctx, c.opt.Channel, c.base, c.headless, c.lg.Log)
 	if err != nil {
+		c.setLoginProgress("error", err)
 		return err
 	}
 	c.browser, c.page, c.closeFn = b, page, closeFn
-	// 若 profile 里已有登录态，等 SSO 自动登录完成（实测 15-20 秒）；未登录则不阻塞
-	wait(5000)
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		if hasAuthCookie(b) && !loginPageShown(page) {
-			break
-		}
-		if !hasAuthCookie(b) {
-			break // 未登录 → 交给 EnsureLogin 走二维码流程
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		wait(2000)
-	}
-	wait(3000)
-	c.lg.Log("浏览器就绪")
+	// Browser readiness is separate from login readiness. EnsureLogin waits for
+	// actual page state; an old cookie must not add a fixed 68-second delay here.
+	c.lg.Log("浏览器连接就绪（%v），登录状态由页面检测确认", time.Since(started).Round(time.Millisecond))
 	return nil
 }
 
 // connectWithBackoffLocked 与 connectLocked 相同，但启动失败后 10 秒内不再重试。
 // 前端每 3 秒轮询 /qr（QRStatus）时会走到这里：一次启动失败要十几秒，
 // 不设退避就会变成「失败→重试→再失败」的空转，CPU 和日志都受不了。
-func (c *Client) connectWithBackoffLocked() error {
+func (c *Client) connectWithBackoffContextLocked(ctx context.Context) error {
 	if c.page != nil && pageAlive(c.page) {
 		return nil
 	}
 	if c.bootErr != nil && time.Since(c.bootAt) < 10*time.Second {
 		return c.bootErr
 	}
-	if err := c.connectLocked(); err != nil {
+	if err := c.connectContextLocked(ctx); err != nil {
 		c.bootAt, c.bootErr = time.Now(), err
 		return err
 	}
@@ -263,12 +283,21 @@ func (c *Client) connectWithBackoffLocked() error {
 
 // Close 关闭浏览器并释放资源
 func (c *Client) Close() {
+	c.preheatMu.Lock()
+	if c.preheatCancel != nil {
+		c.preheatCancel()
+	}
+	c.preheatMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closeFn != nil {
 		c.closeFn()
 		c.closeFn, c.page, c.browser = nil, nil, nil
 	}
+	c.loggedIn.Store(false)
+	c.clearVerificationLocked()
+	c.setLastQR(nil)
+	c.setLoginProgress("", nil)
 }
 
 // IsLoggedIn 当前是否已登录（会按需 Connect）
@@ -282,145 +311,95 @@ func (c *Client) IsLoggedIn() bool {
 }
 
 func (c *Client) loggedInLocked() bool {
-	if c.browser == nil || c.page == nil {
-		return false
-	}
-	return hasAuthCookie(c.browser) && !loginPageShown(c.page)
+	state, err := c.observeLoginLocked(context.Background())
+	return err == nil && state.ready()
 }
 
-// IsLoggedInCached 只读当前登录状态：不启动浏览器、不排队等锁。
-// 给 HTTP 轮询（/qr）用 —— IsLoggedIn 每次都 Connect 并抢锁，抓二维码时页面会被拖住。
+// IsLoggedInCached 读取最近一次后台确认的登录状态，不加浏览器锁、不调用 CDP。
 func (c *Client) IsLoggedInCached() bool {
-	if !c.mu.TryLock() {
-		return false // 正在抓二维码/处理会话，本次按未登录返回，前端稍后再问
-	}
-	defer c.mu.Unlock()
-	return c.loggedInLocked()
+	return c.loggedIn.Load()
 }
 
 // EnsureLogin 确保已登录：已登录直接返回 nil；
 // 未登录则抓取二维码回调给 onQR（连同 Options.OnQR），之后持续监控：
 // 二维码自动刷新时会再次回调，直到扫码成功或 ctx 取消。
 func (c *Client) EnsureLogin(ctx context.Context, onQR func(qr *QRCode)) error {
-	if err := c.Connect(); err != nil {
+	if err := c.connectContext(ctx); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	logged := c.loggedInLocked()
-	c.mu.Unlock()
-	if logged {
-		c.lg.Log("已有有效登录态，无需扫码")
-		return nil
-	}
-
-	push := func(qr *QRCode) {
-		c.setLastQR(qr)
-		if onQR != nil {
-			onQR(qr)
+	started := time.Now()
+	var lastCode string
+	var lastFetch time.Time
+	var lastNotice time.Time
+	probeFailures := 0
+	for {
+		if err := c.lockContext(ctx); err != nil {
+			return err
 		}
-		if c.opt.OnQR != nil {
-			c.opt.OnQR(qr)
+		state, probeErr := c.observeLoginLocked(ctx)
+		c.mu.Unlock()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-	}
-
-	qr, err := c.FetchQR()
-	if errors.Is(err, errAuthPending) {
-		// 刚扫码/已有有效 cookie：按登录成功收尾，绝不重新抓码
-		//（重抓一旦扑空就会触发清 cookie，把刚建立的登录态抹掉）
-		c.lg.Log("检测到登录 cookie，等待页面切换（不重新抓码、不清 cookie）...")
-		if c.settleLogin(45 * time.Second) {
-			c.lg.Log("检测到登录成功！会话已保存到 session/profile")
+		if probeErr != nil {
+			probeFailures++
+			if probeFailures >= 3 {
+				err := fmt.Errorf("连续 3 次登录检测失败，需要恢复浏览器：%w", probeErr)
+				c.setLoginProgress("error", err)
+				return err
+			}
+		} else {
+			probeFailures = 0
+		}
+		if probeErr == nil && state.ready() {
+			c.lg.Log("登录已确认（%v）：Cookie 有效，私信页面就绪且无登录弹窗", time.Since(started).Round(time.Millisecond))
 			return nil
 		}
-		c.lg.Log("登录 cookie 无法进入私信页（可能已失效），清理后重新出码 ...")
-		c.forceResetGuest()
-		qr, err = c.FetchQR()
-	}
-	if err != nil {
-		// 首次抓取失败通常是页面还在渲染/残留登录态，重试而不是直接退出（否则 HTTP 服务跟着挂）
-		for attempt := 2; attempt <= 3; attempt++ {
-			c.lg.Log("! 抓取二维码失败（第 %d 次）：%v，3 秒后重试 ...", attempt-1, err)
-			wait(3000)
-			if qr, err = c.FetchQR(); err == nil {
-				break
-			}
+		if lastNotice.IsZero() || time.Since(lastNotice) >= 15*time.Second {
+			lastNotice = time.Now()
+			c.lg.Log("登录检测：cookie=%v 私信结构=%v 登录弹窗=%v 二维码=%v 身份验证=%v 页面=%s 检测错误=%v", state.Authenticated, state.ChatReady, state.LoginVisible, state.QRVisible, state.VerificationRequired, state.PageURL, probeErr)
 		}
-	}
-	if err != nil {
-		return fmt.Errorf("抓取登录二维码失败：%w", err)
-	}
-	push(qr)
-	c.lg.Log("已抓取登录二维码，等待扫码（最长等到 ctx 取消）...")
-
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	qrRefresh := c.opt.QRRefresh
-	if qrRefresh <= 0 {
-		qrRefresh = 30 * time.Second
-	}
-	nextRefresh := time.Now().Add(qrRefresh)
-	// 扫码后 cookie 已到、登录浮层还没消失时的收尾尝试计数（跳转慢，别无限重试）
-	settleTries := 0
-	lastSettle := time.Time{}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			c.mu.Lock()
-			logged := c.loggedInLocked()
-			authCooked := c.browser != nil && hasAuthCookie(c.browser)
+		if probeErr == nil && (state.VerificationRequired || !state.QRVisible) {
+			if err := c.lockContext(ctx); err != nil {
+				return err
+			}
+			err := c.handleLoginPendingLocked(ctx, state)
 			c.mu.Unlock()
-			if logged {
-				c.lg.Log("检测到登录成功！会话已保存到 session/profile")
-				// 从登录态切到工作页面：重载私信页，并等会话列表渲染完，
-				// 否则紧接着的 RunOnce 会「没扫到会话」
-				c.mu.Lock()
-				_ = c.page.Navigate(chatURL)
+			if err != nil && !errors.Is(err, errAuthPending) && !errors.Is(err, errVerificationRequired) {
+				return err
+			}
+		} else if probeErr == nil {
+			refresh := c.opt.QRRefresh
+			if refresh <= 0 {
+				refresh = 30 * time.Second
+			}
+			if lastFetch.IsZero() || time.Since(lastFetch) >= refresh {
+				if err := c.lockContext(ctx); err != nil {
+					return err
+				}
+				qr, err := c.fetchQRContextLocked(ctx)
 				c.mu.Unlock()
-				c.waitForConvs(30 * time.Second)
-				return nil
-			}
-			// 已拿到登录 cookie，但页面仍停在登录浮层（扫码成功后跳转慢/浮层没关）：
-			// 主动切到私信页确认。不这样的话就会「用户明明扫码点了登录，程序一直说没登录」。
-			if authCooked && settleTries < 5 && time.Since(lastSettle) > 8*time.Second {
-				settleTries++
-				lastSettle = time.Now()
-				if settleTries == 1 {
-					c.lg.Log("检测到登录 cookie，但页面还停在登录态，切换私信页确认登录 ...")
-				}
-				if c.settleLogin(15 * time.Second) {
-					c.lg.Log("检测到登录成功！会话已保存到 session/profile")
-					return nil
-				}
-			}
-			if time.Now().After(nextRefresh) {
-				if qr2, e := c.FetchQR(); e == nil {
-					if qr2.Base64 != qr.Base64 {
-						qr = qr2
-						push(qr)
-						c.lg.Log("二维码已刷新")
+				lastFetch = time.Now()
+				if err == nil && qr != nil && qr.Base64 != lastCode {
+					lastCode = qr.Base64
+					if onQR != nil {
+						onQR(qr)
 					}
+					if c.opt.OnQR != nil {
+						c.opt.OnQR(qr)
+					}
+					c.lg.Log("登录二维码已更新，等待扫码...")
+				} else if err != nil && !errors.Is(err, errAuthPending) && !errors.Is(err, errVerificationRequired) && ctx.Err() == nil {
+					err = fmt.Errorf("抓取登录二维码失败：%w", err)
+					c.setLoginProgress("error", err)
+					c.lg.Log("! %v", err)
+					return err
 				}
-				nextRefresh = time.Now().Add(qrRefresh)
 			}
 		}
-	}
-}
-
-// waitForConvs 轮询等会话列表渲染出来（最多 timeout），返回是否扫到
-func (c *Client) waitForConvs(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for {
-		if n := len(evalConvList(c.page)); n > 0 {
-			c.lg.Log("会话列表已就绪（%d 项）", n)
-			return true
+		if err := waitContext(ctx, time.Second); err != nil {
+			return err
 		}
-		if time.Now().After(deadline) {
-			c.lg.Log("等待会话列表超时（%v），页面可能还没加载完", timeout)
-			return false
-		}
-		wait(2000)
 	}
 }
 
@@ -434,8 +413,7 @@ func (c *Client) RunOnce(dry bool) (int, error) {
 	if !c.loggedInLocked() {
 		return 0, errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
-	c.waitForConvs(30 * time.Second) // 列表没渲染完就扫会扑空
-	return runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, c.fu, false, false), nil
+	return runOnce(c.page, c.runtimeConfig(), dry, c.hist, c.lg, c.base, c.fu, false, false), nil
 }
 
 // SendTo 定向回复指定会话（按昵称匹配，忽略未读标记）。dry=true 只判定不发送。
@@ -449,31 +427,38 @@ func (c *Client) SendTo(name string, dry bool) (int, error) {
 	if !c.loggedInLocked() {
 		return 0, errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
-	c.waitForConvs(30 * time.Second)
-	if !c.cfg.AutoReply {
+	cfg := c.runtimeConfig()
+	if !cfg.AutoReply {
 		return 0, errors.New("该账号已关闭自动回复（SetAutoReply(false) / Options.AutoReply=false）")
 	}
-	return replyToNamed(c.page, name, c.cfg, dry, c.hist, c.lg, c.base, c.fu), nil
+	return replyToNamed(c.page, name, cfg, dry, c.hist, c.lg, c.base, c.fu), nil
 }
 
 // Run 持续轮询（等价 Windows 版 -send -loop）。页面断开会自动重连（各 3 次重试）。
 func (c *Client) Run(ctx context.Context, dry bool) error {
-	if err := c.Connect(); err != nil {
+	if err := c.connectContext(ctx); err != nil {
 		return err
 	}
-	if !c.IsLoggedIn() {
+	if !c.settleLogin(ctx, 15*time.Second) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return errors.New("未登录：请先调用 EnsureLogin 完成扫码")
 	}
-	interval := c.cfg.PollIntervalSeconds
+	interval := c.runtimeConfig().PollIntervalSeconds
 	if interval <= 0 {
 		interval = 25
 	}
-	c.mu.Lock()
-	c.waitForConvs(30 * time.Second)
-	c.mu.Unlock()
 	for {
-		c.mu.Lock()
-		n := runOnce(c.page, c.cfg, dry, c.hist, c.lg, c.base, c.fu, false, false)
+		if err := c.lockContext(ctx); err != nil {
+			return err
+		}
+		state, err := c.observeLoginLocked(ctx)
+		if err != nil || !state.ready() {
+			c.mu.Unlock()
+			return fmt.Errorf("登录状态暂不可用（cookie=%v 私信结构=%v 登录弹窗=%v 检测错误=%v），请重新确认登录后恢复轮询", state.Authenticated, state.ChatReady, state.LoginVisible, err)
+		}
+		n := runOnce(c.page.Context(ctx), c.runtimeConfig(), dry, c.hist, c.lg, c.base, c.fu, false, false)
 		page := c.page
 		c.mu.Unlock()
 		_ = n
@@ -492,7 +477,9 @@ func (c *Client) Run(ctx context.Context, dry bool) error {
 		if !alive {
 			alive = false
 			for i := 0; i < 3; i++ {
-				wait(2000)
+				if err := waitContext(ctx, 2*time.Second); err != nil {
+					return err
+				}
 				c.mu.Lock()
 				alive = pageAlive(c.page)
 				c.mu.Unlock()
@@ -506,7 +493,7 @@ func (c *Client) Run(ctx context.Context, dry bool) error {
 				ok := false
 				for attempt := 1; attempt <= 3; attempt++ {
 					c.mu.Lock()
-					err := c.connectLocked()
+					err := c.connectContextLocked(ctx)
 					c.mu.Unlock()
 					if err == nil {
 						ok = true
@@ -537,7 +524,9 @@ func (c *Client) Account() string { return c.opt.Account }
 // SetAutoReply 运行时开关该账号的自动回复，下一次轮询生效。
 // 关掉后：不再发送任何消息，但二次消息截图/观察照常。
 func (c *Client) SetAutoReply(on bool) {
+	c.cfgMu.Lock()
 	c.cfg.AutoReply = on
+	c.cfgMu.Unlock()
 	if c.lg != nil {
 		if on {
 			c.lg.Log("已开启自动回复")
@@ -545,6 +534,12 @@ func (c *Client) SetAutoReply(on bool) {
 			c.lg.Log("已关闭自动回复（不再发送任何消息，二次消息照常截图）")
 		}
 	}
+}
+
+func (c *Client) runtimeConfig() *Config {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.cfg.clone()
 }
 
 // FollowUps 返回「已自动回复、正在观察客户二次消息」的会话（最近的排前面）。

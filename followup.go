@@ -248,6 +248,9 @@ func scanFollowUps(page *rod.Page, items []ConvItem, cfg *Config, fs *followStor
 	}
 	shots := 0
 	for _, c := range items {
+		if page.GetContext().Err() != nil {
+			break
+		}
 		if c.Kind == "stranger_folder" || looksLikeGroup(c) {
 			continue
 		}

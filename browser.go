@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -51,7 +53,10 @@ func killStaleChrome(dir string) {
 		killStaleChromeWindows(dir)
 		return
 	}
-	_ = exec.Command("pkill", "-9", "-f", "user-data-dir="+dir).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pattern := `(^|[[:space:]])--user-data-dir=` + regexp.QuoteMeta(dir) + `([[:space:]]|$)`
+	_ = exec.CommandContext(ctx, "pkill", "-9", "-f", pattern).Run()
 	time.Sleep(500 * time.Millisecond)
 }
 
@@ -67,7 +72,9 @@ func killStaleChromeWindows(dir string) {
 	script := "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" | " +
 		"Where-Object { $_.CommandLine -and $_.CommandLine -like (\"*\" + $env:DY_PROFILE_DIR + \"*\") } | " +
 		"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-	cmd := exec.Command(ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
 	cmd.Env = append(os.Environ(), "DY_PROFILE_DIR="+dir)
 	_ = cmd.Run()
 	time.Sleep(800 * time.Millisecond) // 等进程真正释放 profile 句柄
@@ -179,95 +186,152 @@ func newLauncher(channel, base string, headless bool) (*launcher.Launcher, error
 	return l, nil
 }
 
-// 浏览器各启动步骤的超时。之前没有超时：任一步卡住（DevTools 连不上 / 私信页
-// load 事件不来）就会永远停在「启动浏览器 ...」一行，进程看着活着其实在空转。
+// 启动各步骤分别设置超时；导航返回并不表示页面渲染或登录已完成。
 const (
-	stepLaunchTimeout   = 90 * time.Second // chromium 进程起来并给出调试端口
-	stepConnectTimeout  = 60 * time.Second // CDP 连接
-	stepNavigateTimeout = 90 * time.Second // 打开私信页（服务器上风控/网络慢是常态，给足余量）
+	stepLaunchTimeout   = 45 * time.Second // chromium 进程起来并给出调试端口
+	stepConnectTimeout  = 15 * time.Second // CDP 连接
+	stepNavigateTimeout = 30 * time.Second // 打开私信页（服务器上风控/网络慢是常态，给足余量）
 )
 
 // openPage 打开 douyin.com/chat。headless=true 用于 Linux 服务器（无窗口）；
 // headless=false 用于本地调试（弹窗口）。会话保存在 BaseDir/session/profile。
 // 每一步都带超时并打日志：卡住时能看到具体停在哪一步，而不是一行「启动浏览器」挂死。
-func openPage(channel, base string, headless bool, logf func(format string, args ...any)) (*rod.Browser, *rod.Page, func(), error) {
+func openPage(ctx context.Context, channel, base string, headless bool, logf func(format string, args ...any)) (*rod.Browser, *rod.Page, func(), error) {
+	return openPageAtURL(ctx, channel, base, headless, chatURL, logf)
+}
+
+func openPageAtURL(ctx context.Context, channel, base string, headless bool, targetURL string, logf func(format string, args ...any)) (*rod.Browser, *rod.Page, func(), error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	l, err := newLauncher(channel, base, headless)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// 启动前清理上次残留的单例锁、杀掉占着 profile 的残留进程，避免“profile 正被占用”启动失败
-	clearProfileLocks(profileDir(base))
+	started := time.Now()
 	killStaleChrome(profileDir(base))
-
-	// Launch 同样可能挂死（chromium 起了却一直不吐调试端口，典型原因是 profile 被活进程占用）。
-	// 包一层超时：到点杀掉残留进程并报错，让上层走重连/退避，而不是一行日志挂到天荒地老。
-	type launchRes struct {
-		url string
-		err error
-	}
-	launchCh := make(chan launchRes, 1)
-	go func() {
-		u, err := l.Launch()
-		launchCh <- launchRes{u, err}
-	}()
+	clearProfileLocks(profileDir(base))
+	browserLog, _ := os.OpenFile(filepath.Join(base, "logs", "chromium.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	var l *launcher.Launcher
 	var u string
-	select {
-	case r := <-launchCh:
-		u, err = r.url, r.err
-	case <-time.After(stepLaunchTimeout):
-		killStaleChrome(profileDir(base))
-		return nil, nil, nil, fmt.Errorf("启动浏览器进程超时（%v）：chromium 一直没给出调试端口（常见原因：profile 被另一个活着的浏览器实例占用），已清理残留进程", stepLaunchTimeout)
-	}
-	if err != nil {
-		// 重试一次：再杀残留进程 + 清锁后重启（应对旧进程刚在释放套接字的情况）
-		if l2, e2 := newLauncher(channel, base, headless); e2 == nil {
-			killStaleChrome(profileDir(base))
-			clearProfileLocks(profileDir(base))
-			u, err = l2.Launch()
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
 		}
-	}
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("启动浏览器进程失败：%w（如果另一个实例正在运行，请先关闭它）", err)
-	}
-	logf("浏览器进程已启动，连接 DevTools ...")
-	b := rod.New().ControlURL(u)
-	// Connect 没有自带超时：端口被防火墙吞/进程假死时会永远等。
-	// 不能用 b.Timeout()（会给整个浏览器会话设死限），用并行等待的方式只限「连接」这一步。
-	connDone := make(chan error, 1)
-	go func() { connDone <- b.Connect() }()
-	select {
-	case err := <-connDone:
+		l, err = newLauncher(channel, base, headless)
 		if err != nil {
-			_ = b.Close()
-			return nil, nil, nil, fmt.Errorf("连接浏览器 DevTools 失败：%w", err)
+			break
 		}
-	case <-time.After(stepConnectTimeout):
-		_ = b.Close()
-		killStaleChrome(profileDir(base))
-		return nil, nil, nil, fmt.Errorf("连接浏览器 DevTools 超时（%v）：chromium 可能没起来或端口不通，已清理残留进程，请重试", stepConnectTimeout)
+		if browserLog != nil {
+			l.Logger(browserLog)
+		}
+		launchCtx, launchCancel := context.WithTimeout(ctx, stepLaunchTimeout)
+		phaseStart := time.Now()
+		u, err = l.Context(launchCtx).Launch()
+		launchCancel()
+		logf("浏览器进程启动：第 %d 次，耗时 %v，成功=%v", attempt, time.Since(phaseStart).Round(time.Millisecond), err == nil)
+		if err == nil {
+			break
+		}
+		l.Kill()
+		clearProfileLocks(profileDir(base))
 	}
-	page, err := b.Page(proto.TargetCreateTarget{})
 	if err != nil {
-		_ = b.Close()
+		if browserLog != nil {
+			_ = browserLog.Close()
+		}
+		return nil, nil, nil, fmt.Errorf("启动浏览器失败：%w（详细输出见 logs/chromium.log）", err)
+	}
+	// The browser connection needs a lifetime context, not a startup deadline.
+	// Cancel it on failed startup so in-flight Connect/Page calls actually stop.
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	b := rod.New().Context(sessionCtx).ControlURL(u)
+	connectedOK := false
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			if connectedOK {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = b.Context(closeCtx).Close()
+				cancel()
+			}
+			sessionCancel()
+			l.Kill()
+			if browserLog != nil {
+				_ = browserLog.Close()
+			}
+		})
+	}
+	failed := true
+	defer func() {
+		if failed {
+			cleanup()
+		}
+	}()
+	phaseStart := time.Now()
+	logf("浏览器进程已启动，连接 DevTools ...")
+	connectCtx, connectCancel := context.WithTimeout(ctx, stepConnectTimeout)
+	defer connectCancel()
+	connected := make(chan error, 1)
+	go func() { connected <- b.Connect() }()
+	select {
+	case err = <-connected:
+	case <-connectCtx.Done():
+		err = connectCtx.Err()
+		sessionCancel()
+	}
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("连接 DevTools 失败（耗时 %v）：%w", time.Since(phaseStart).Round(time.Millisecond), err)
+	}
+	connectedOK = true
+	logf("DevTools 已连接（%v）", time.Since(phaseStart).Round(time.Millisecond))
+	phaseStart = time.Now()
+	pageCtx, pageCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer pageCancel()
+	// Page owns Mouse/Keyboard/root objects. Creating it on a temporary
+	// browser context leaves those objects canceled even if Page.Context is
+	// later replaced. Build the entire page on the lifetime context instead.
+	type pageResult struct {
+		page *rod.Page
+		err  error
+	}
+	pageDone := make(chan pageResult, 1)
+	go func() { p, e := b.Page(proto.TargetCreateTarget{}); pageDone <- pageResult{p, e} }()
+	var page *rod.Page
+	select {
+	case result := <-pageDone:
+		page, err = result.page, result.err
+	case <-pageCtx.Done():
+		err = pageCtx.Err()
+		sessionCancel()
+	}
+	if err != nil {
 		return nil, nil, nil, fmt.Errorf("新建页面失败：%w", err)
 	}
-	// Navigate 等的是 load 事件：网络/风控把请求挂住时它永远不来，不设超时
-	// 整个进程就会停在「启动浏览器 ...」。超时不算致命——页面可能只是慢，
-	// 后续登录/二维码流程自己会继续等渲染。
-	navCtx, navCancel := context.WithTimeout(context.Background(), stepNavigateTimeout)
-	defer navCancel()
-	if err := page.Context(navCtx).Navigate(chatURL); err != nil {
-		logf("! 私信页 %v 内没有加载完（网络慢或被风控拦截），先继续登录流程", stepNavigateTimeout)
+	logf("标签页已创建（%v）", time.Since(phaseStart).Round(time.Millisecond))
+	phaseStart = time.Now()
+	navCtx, navCancel := context.WithTimeout(ctx, stepNavigateTimeout)
+	err = page.Context(navCtx).Navigate(targetURL)
+	navCancel()
+	if ctx.Err() != nil {
+		return nil, nil, nil, ctx.Err()
 	}
-	return b, page, func() { _ = b.Close() }, nil
+	if err != nil {
+		logf("! 私信页导航暂未完成（%v）：%v，后续继续检测页面", time.Since(phaseStart).Round(time.Millisecond), err)
+	} else {
+		logf("私信页导航完成（%v）；页面渲染和登录另行确认", time.Since(phaseStart).Round(time.Millisecond))
+	}
+	logf("浏览器启动各步骤完成（总计 %v）", time.Since(started).Round(time.Millisecond))
+	failed = false
+	return b, page, cleanup, nil
 }
 
 // hasAuthCookie 复刻 Python has_auth_cookie
 func hasAuthCookie(b *rod.Browser) bool {
-	cookies, err := b.GetCookies()
+	if b == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), loginProbeTimeout)
+	defer cancel()
+	cookies, err := b.Context(ctx).GetCookies()
 	if err != nil {
 		return false
 	}
@@ -292,18 +356,26 @@ func loginPageShown(page *rod.Page) bool {
 }
 
 func pageAlive(page *rod.Page) bool {
-	_, err := page.Eval("() => 1")
+	if page == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), loginProbeTimeout)
+	defer cancel()
+	_, err := page.Context(ctx).Eval("() => 1")
 	return err == nil
 }
 
 func wait(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }
 
 func mouseClick(page *rod.Page, x, y float64) {
-	page.Mouse.MustMoveTo(x, y).MustClick(proto.InputMouseButtonLeft)
+	if err := page.Mouse.MoveTo(proto.Point{X: x, Y: y}); err != nil {
+		return
+	}
+	_ = page.Mouse.Click(proto.InputMouseButtonLeft, 1)
 }
 
 func saveShot(page *rod.Page, path string) {
-	data, err := page.Screenshot(false, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng})
+	data, err := page.Timeout(5*time.Second).Screenshot(false, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng})
 	if err != nil {
 		return
 	}

@@ -63,7 +63,7 @@ type BtnPos struct {
 // ---------------------------------------------------------------- Eval 辅助
 
 func evalRaw(page *rod.Page, js string) (*gson.JSON, bool) {
-	res, err := page.Eval(js)
+	res, err := page.Timeout(loginProbeTimeout).Eval(js)
 	if err != nil || res == nil {
 		return nil, false
 	}
@@ -152,6 +152,9 @@ func waitInputReady(page *rod.Page, maxWait time.Duration) *InputFocus {
 	deadline := time.Now().Add(maxWait)
 	var last *InputFocus
 	for {
+		if page.GetContext().Err() != nil {
+			return last
+		}
 		last = evalFocusInput(page)
 		if last != nil && last.Editable && !last.Disabled {
 			return last
@@ -193,7 +196,7 @@ func evalSendBtn(page *rod.Page) *BtnPos {
 // 这里统一改成：JS 打 data 标记 → 元素级 Click（rod 内部会 scrollIntoView 并用自己的坐标点击）。
 
 func evalArgs(page *rod.Page, js string, args ...interface{}) (*gson.JSON, bool) {
-	res, err := page.Eval(js, args...)
+	res, err := page.Timeout(loginProbeTimeout).Eval(js, args...)
 	if err != nil || res == nil {
 		return nil, false
 	}
@@ -235,6 +238,9 @@ func jsClickMarked(page *rod.Page, sel string) bool {
 func headerHas(page *rod.Page, name string, maxWait time.Duration) bool {
 	deadline := time.Now().Add(maxWait)
 	for {
+		if page.GetContext().Err() != nil {
+			return false
+		}
 		if hdr := evalHeader(page); hdr != nil && strings.Contains(hdr.Text, name) {
 			return true
 		}
@@ -338,6 +344,9 @@ func openedNow(st *ChatState, name string) bool {
 func waitOpened(page *rod.Page, name string, maxWait time.Duration) (*ChatState, bool) {
 	deadline := time.Now().Add(maxWait)
 	for {
+		if page.GetContext().Err() != nil {
+			return nil, false
+		}
 		st := evalChatState(page)
 		if openedNow(st, name) {
 			return st, true
@@ -357,6 +366,9 @@ func waitChatPanel(page *rod.Page, st *ChatState, lg *Logger) *ChatState {
 	deadline := time.Now().Add(12 * time.Second)
 	var last = st
 	for {
+		if page.GetContext().Err() != nil {
+			return last
+		}
 		last = evalChatState(page)
 		if last != nil && (last.Bubbles > 0 || last.HasEditor) {
 			return last
@@ -437,6 +449,9 @@ func openConversation(page *rod.Page, name string, lg *Logger) (bool, string) {
 	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
+		if page.GetContext().Err() != nil {
+			return false, "操作已取消"
+		}
 		mode := markConv(page, name)
 		pt := evalRowPoint(page, name)
 		if (pt == nil || !pt.Ok) && mode == "none" {
@@ -617,6 +632,9 @@ func failShot(page *rod.Page, base, name, tag string) string {
 
 // replyOne 复刻 Python reply_one(page, conv, cfg, dry, hist) -> str
 func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string, fs *followStore) string {
+	if page.GetContext().Err() != nil {
+		return "操作已取消，未发送"
+	}
 	name := conv.Name
 	// 打开会话：DOM 标记 + 元素点击（浏览器自己算坐标并滚动到可见），
 	// 不再依赖 JS 计算出的坐标——服务器 headless 环境下那套坐标会整体偏移，点了没反应/点错会话
@@ -668,7 +686,9 @@ func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[str
 	}
 
 	// 打字前随机停顿，模拟真人
-	wait(typingDelayMs(cfg))
+	if waitContext(page.GetContext(), time.Duration(typingDelayMs(cfg))*time.Millisecond) != nil {
+		return "操作已取消，未发送"
+	}
 
 	// 聚焦输入框：DOM 标记 + Focus + 元素点击（服务器上坐标点击点不中，必须走元素）
 	if !markInput(page) {
@@ -695,6 +715,9 @@ func replyOne(page *rod.Page, conv ConvItem, cfg *Config, dry bool, hist map[str
 
 	// rod 对中文的输入要用 InsertText（等价于逐字上屏）；逐字发送 + 随机间隔，复刻 Python 版节奏
 	for _, r := range text {
+		if page.GetContext().Err() != nil {
+			return "操作已取消，未发送"
+		}
 		if err := page.InsertText(string(r)); err != nil {
 			return fmt.Sprintf("输入失败：%v（截图 %s）", err, failShot(page, base, name, "typefail"))
 		}
@@ -827,6 +850,9 @@ func backFromFolder(page *rod.Page, lg *Logger) {
 func processList(page *rod.Page, items []ConvItem, cfg *Config, dry bool, hist map[string]string, lg *Logger, base string, fs *followStore) int {
 	sent := 0
 	for _, c := range items {
+		if page.GetContext().Err() != nil {
+			break
+		}
 		if inQuietHours(cfg.QuietHours) {
 			lg.Log("当前在免打扰时段，本轮不发送")
 			break
@@ -1021,6 +1047,9 @@ func runOnce(page *rod.Page, cfg *Config, dry bool, hist map[string]string, lg *
 
 	// ---- 2) 陌生人消息（非互关用户的私信会折叠在这里） ----
 	for _, f := range folders {
+		if page.GetContext().Err() != nil {
+			break
+		}
 		if !f.Unread && !dump && !cfg.AutoReply {
 			continue // 关闭自动回复的账号：入口没红点就不点开（点开只为内部截图/回复）
 		}

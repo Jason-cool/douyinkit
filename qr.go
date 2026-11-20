@@ -6,21 +6,21 @@ package douyinkit
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"errors"
 	"fmt"
 	"image/png"
 	"path/filepath"
 	"regexp"
 	"time"
-
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // errAuthPending 表示「已检测到登录 cookie，但页面上没有二维码」——
 // 典型出现在刚扫码确认、页面正在跳转的瞬间。调用方必须按「正在登录」处理：
 // 等页面就绪即可，绝不能当未登录去清 cookie（那样会把用户刚建立的登录态当场抹掉）。
-var errAuthPending = errors.New("检测到登录 cookie，页面正在切换（保留 cookie）")
+var errAuthPending = errors.New("页面正在加载或确认登录（保留现有会话）")
+
+var errVerificationRequired = errors.New("抖音要求额外身份验证，请由账号本人完成短信验证后继续")
 
 // qrFetchReuse 同一个二维码的复用窗口。
 // 多个入口并发抓码（/qr 轮询、EnsureLogin、用户重复点击）时，后来者会等锁；
@@ -69,127 +69,131 @@ func (c *Client) FetchQR() (*QRCode, error) {
 }
 
 func (c *Client) fetchQRLocked() (*QRCode, error) {
+	return c.fetchQRContextLocked(context.Background())
+}
+
+func (c *Client) fetchQRContextLocked(ctx context.Context) (*QRCode, error) {
 	if c.page == nil {
 		return nil, fmt.Errorf("页面未连接，请先 Connect()")
 	}
-
-	// 0) 刚抓过就复用：并发入口（/qr 轮询 + EnsureLogin + 重复点击）不再重复抓。
-	//    否则第二次抓取时页面可能正在重载，扑空后会走「清 cookie 自愈」，
-	//    把用户刚扫码取得的登录态一起清掉（服务器上最常见的「扫码后没登录」）。
-	if c.lastQR != nil && time.Since(c.lastQR.CapturedAt) < qrFetchReuse && !c.loggedInLocked() {
-		c.lg.Log("复用 %.0f 秒前的登录二维码（避免并发重复抓取）", time.Since(c.lastQR.CapturedAt).Seconds())
-		return c.lastQR, nil
+	state, err := c.observeLoginLocked(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("检测登录页面失败：%w", err)
 	}
-
-	// 1) 页面上已经有二维码 → 直接截
-	if qr := c.grabQR(1500 * time.Millisecond); qr != nil {
-		return c.cacheQR(qr), nil
-	}
-
-	// 2) 二维码过期 → 先点「点击刷新」
-	if v, ok := evalRaw(c.page, refreshJS); ok && !v.Nil() && !v.Get("x").Nil() {
-		mouseClick(c.page, v.Get("x").Num(), v.Get("y").Num())
-		if qr := c.grabQR(6 * time.Second); qr != nil {
-			return c.cacheQR(qr), nil
-		}
-	}
-
-	// 3) 检测到登录 cookie：可能只是页面还没渲染完，先软重载（不动 cookie，避免误删有效登录态）
-	if c.browser != nil && hasAuthCookie(c.browser) {
-		c.lg.Log("页面没有二维码，但检测到登录 cookie，重载等待渲染 ...")
-		_ = c.page.Navigate(chatURL)
-		if qr := c.grabQR(25 * time.Second); qr != nil {
-			return c.cacheQR(qr), nil
-		}
-		// 25 秒都没有二维码，但已经不在登录页（登录浮层消失/进了私信页）：
-		// 说明登录其实成功了，只是这个页面本来就不该有二维码 —— 按「正在登录」返回。
-		if c.loggedInLocked() {
-			c.lg.Log("登录态已生效（页面已进入私信页），保留 cookie，不再抓码")
-			return nil, errAuthPending
-		}
-	}
-
-	// 4) 清 cookie 前最后一道闸：只要还有登录 cookie 就绝不清。
-	//    清 cookie 是不可逆的：用户刚扫码、页面还没跳完时清掉，登录结果当场作废，
-	//    之后无论怎么轮询都拿不到登录态（服务器上「扫码点了登录却没登录」的主因）。
-	if c.browser != nil && hasAuthCookie(c.browser) {
-		c.lg.Log("仍有登录 cookie：按「正在登录」处理，保留 cookie（不清）")
+	if state.ready() {
 		return nil, errAuthPending
 	}
-
-	// 5) 无登录态（或 cookie 已失效）→ 清 cookie 回游客态。
-	//    典型故障：profile 里只剩 ttwid/odin_tt 这类匿名 cookie，前端路由以为已登录，
-	//    停在私信页骨架屏，既不显示二维码也没有登录浮层，此时只能清干净重新来。
-	c.resetGuestLocked()
-	if qr := c.grabQR(30 * time.Second); qr != nil {
+	if state.VerificationRequired || !state.QRVisible {
+		return nil, c.handleLoginPendingLocked(ctx, state)
+	}
+	if qr, ok := c.LatestQR(); ok && time.Since(qr.CapturedAt) < qrFetchReuse {
+		return qr, nil
+	}
+	c.setLoginProgress("fetching", nil)
+	qr, captureErr := c.grabQR(ctx, 15*time.Second)
+	if qr != nil {
 		return c.cacheQR(qr), nil
 	}
-
-	// 6) 兜底：整页再重载一次
-	_ = c.page.Navigate(chatURL)
-	if qr := c.grabQR(20 * time.Second); qr != nil {
-		return c.cacheQR(qr), nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	saveShot(c.page, filepath.Join(c.base, "shots", "qr_fail.png"))
-	return nil, fmt.Errorf("没找到二维码元素（页面可能不是登录页，已存截图 shots/qr_fail.png）")
+	pageCtx, cancel := context.WithTimeout(ctx, loginProbeTimeout)
+	v, evalErr := c.page.Context(pageCtx).Eval(refreshJS)
+	cancel()
+	if evalErr == nil && !v.Value.Nil() && !v.Value.Get("x").Nil() {
+		// DOM event fallback also works when CDP mouse events are not accepted.
+		clickCtx, clickCancel := context.WithTimeout(ctx, loginProbeTimeout)
+		_, _ = c.page.Context(clickCtx).Eval(JS_POINTER_CLICK_JS, v.Value.Get("x").Num(), v.Value.Get("y").Num())
+		clickCancel()
+		if qr, err := c.grabQR(ctx, 8*time.Second); qr != nil {
+			return c.cacheQR(qr), nil
+		} else {
+			captureErr = err
+		}
+	}
+	// Recheck after capture: the QR may have disappeared because scanning has
+	// completed. An incomplete transition must never erase browser storage.
+	state, err = c.observeLoginLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if state.ready() {
+		return nil, errAuthPending
+	}
+	if state.VerificationRequired || !state.QRVisible {
+		return nil, c.handleLoginPendingLocked(ctx, state)
+	}
+	// A visible QR with an existing Cookie still needs to be delivered. Failure
+	// here is a capture error, not proof that the user is completing login.
+	path := filepath.Join(c.base, "shots", "qr_fail.png")
+	saveShot(c.page.Context(ctx), path)
+	err = fmt.Errorf("二维码元素可见但图片提取失败（保留 Cookie）：%w；页面截图 %s", captureErr, path)
+	c.setLoginProgress("error", err)
+	c.lg.Log("! %v", err)
+	return nil, err
 }
 
-// cacheQR 记录本轮抓到的二维码，供并发入口复用 + LatestQR 查询。
-// 调用方必须已持有 c.mu（fetchQRLocked / QRStatus 内部）。
+// cacheQR must be called with c.mu held. Snapshot reads use a separate lock.
 func (c *Client) cacheQR(qr *QRCode) *QRCode {
-	c.lastQR = qr
+	c.clearVerificationLocked()
+	c.setLastQR(qr)
+	c.setLoginProgress("waiting_scan", nil)
 	return qr
 }
 
 // grabQR 在 timeout 内轮询二维码元素，出现且可见就截图返回；超时返回 nil。
 // 轮询而不是 Element 阻塞等待，是因为登录页渲染慢时元素会先出现后填图。
-func (c *Client) grabQR(timeout time.Duration) *QRCode {
-	deadline := time.Now().Add(timeout)
-	for {
+func (c *Client) grabQR(ctx context.Context, timeout time.Duration) (*QRCode, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastErr error
+	for ctx.Err() == nil {
 		for _, sel := range []string{qrSelPrimary, qrSelFallback} {
-			el, err := c.page.Timeout(1200 * time.Millisecond).Element(sel)
-			if err != nil || el == nil {
-				continue
+			if ctx.Err() != nil {
+				break
 			}
-			if ok, e := el.Visible(); e != nil || !ok {
-				continue
+			qr, err := c.captureQR(ctx, sel)
+			if err == nil {
+				return qr, nil
 			}
-			data, err := el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
-			if err != nil || !looksLikeQR(data) {
-				continue // 空白 / 只画了 logo 的半成品，继续等它渲染完
-			}
-			b64 := base64.StdEncoding.EncodeToString(data)
-			return &QRCode{
-				Base64:     b64,
-				DataURL:    "data:image/png;base64," + b64,
-				CapturedAt: time.Now(),
+			// A final fallback lookup timing out must not erase the useful image
+			// validation/capture error already observed on the primary element.
+			deadlineError := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+			if lastErr == nil || (!errors.Is(err, errQRNotFound) && !deadlineError) || errors.Is(lastErr, errQRNotFound) {
+				lastErr = err
 			}
 		}
-		if time.Now().After(deadline) {
-			return nil
+		if waitContext(ctx, 400*time.Millisecond) != nil {
+			break
 		}
-		wait(600)
 	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return nil, fmt.Errorf("二维码提取未完成：%w", lastErr)
 }
 
 // looksLikeQR 判断截图是不是「画完了」的二维码。
 // 抖音的二维码是 canvas 异步绘制的：先出白色圆角底板 + 抖音 logo，几百毫秒后才填上黑格子。
 // 只判断字节数会把「只有 logo 的半成品」当成二维码发给前端，用户扫半天没反应。
 // 这里解码 PNG 统计深色像素占比：真二维码约 25%~55%，只有 logo 时不足 8%。
-func looksLikeQR(data []byte) bool {
+func looksLikeQR(data []byte) bool { return validateQRImage(data) == nil }
+
+func validateQRImage(data []byte) error {
 	img, err := png.Decode(bytes.NewReader(data))
 	if err != nil {
-		return false
+		return fmt.Errorf("二维码 PNG 解码失败：%w", err)
 	}
 	b := img.Bounds()
 	if b.Dx() < 80 || b.Dy() < 80 {
-		return false
+		return fmt.Errorf("图片尺寸过小：%dx%d", b.Dx(), b.Dy())
 	}
 	var total, dark int
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
-			r, g, bl, _ := img.At(x, y).RGBA()
+			r, g, bl, a := img.At(x, y).RGBA()
+			// Composite transparency onto white before counting dark pixels.
+			r, g, bl = r+0xffff-a, g+0xffff-a, bl+0xffff-a
 			if r>>8 < 110 && g>>8 < 110 && bl>>8 < 110 {
 				dark++
 			}
@@ -197,67 +201,74 @@ func looksLikeQR(data []byte) bool {
 		}
 	}
 	if total == 0 {
-		return false
+		return fmt.Errorf("二维码图片为空")
 	}
 	ratio := float64(dark) / float64(total)
-	return ratio > 0.12 && ratio < 0.75
-}
-
-// resetGuestLocked 把页面强制打回「游客态」：清 cookie + 前端 storage，再重载私信页。
-// 实测（douyinkit-data 无登录态）：清完 3 秒内抖音会自动弹出登录框并渲染二维码。
-func (c *Client) resetGuestLocked() {
-	c.lg.Log("页面不是登录页（疑似残留登录态/骨架屏），清理 cookie 后重载 ...")
-	_ = proto.NetworkClearBrowserCookies{}.Call(c.page)
-	_, _ = c.page.Eval(`() => { try{localStorage.clear()}catch(e){} try{sessionStorage.clear()}catch(e){} return 1 }`)
-	_ = c.page.Navigate(chatURL)
-	wait(2500)
-}
-
-// settleLogin 检测到登录 cookie 后，等页面真正进入私信页（切页 + 等会话列表）。
-// 返回 true 表示登录已生效。全程不动 cookie —— 与「清 cookie 自愈」相反，
-// 专门用于「用户已经扫码点了登录，但页面还在跳转/浮层没消失」的收尾。
-func (c *Client) settleLogin(timeout time.Duration) bool {
-	c.mu.Lock()
-	page := c.page
-	c.mu.Unlock()
-	if page == nil {
-		return false
+	if ratio <= 0.12 || ratio >= 0.75 {
+		return fmt.Errorf("图片不像完整二维码：%dx%d，深色像素 %.1f%%", b.Dx(), b.Dy(), ratio*100)
 	}
-	_ = page.Navigate(chatURL)
-	wait(2000)
-	if c.waitForConvs(timeout) {
-		return true
-	}
-	c.mu.Lock()
-	ok := c.loggedInLocked()
-	c.mu.Unlock()
-	return ok
+	return nil
 }
 
-// forceResetGuest 主动清 cookie 回游客态并清掉二维码缓存（仅在确认登录 cookie 已失效时用）。
-func (c *Client) forceResetGuest() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lastQR = nil
-	if c.page != nil {
-		c.resetGuestLocked()
+// settleLogin uses the same readiness test as Run/QRStatus. A positional list
+// match is never sufficient, and a slow page never causes Cookie deletion.
+func (c *Client) settleLogin(ctx context.Context, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	navigated := false
+	for ctx.Err() == nil {
+		if c.lockContext(ctx) != nil {
+			return false
+		}
+		state, err := c.observeLoginLocked(ctx)
+		if err == nil && state.ready() {
+			c.mu.Unlock()
+			return true
+		}
+		if err == nil && state.VerificationRequired {
+			c.mu.Unlock()
+			return false
+		}
+		if err == nil && !state.Authenticated {
+			c.mu.Unlock()
+			return false
+		}
+		if err == nil && !navigated {
+			navigated = true
+			_ = c.navigateLocked(ctx)
+		}
+		c.mu.Unlock()
+		if waitContext(ctx, 500*time.Millisecond) != nil {
+			return false
+		}
 	}
+	return false
 }
 
-// LatestQR 返回最近一次抓取的二维码（没有则返回 nil, false）
+// LatestQR reads only a snapshot. It does not acquire the browser lock or call CDP.
+// Expired QR codes and QR codes from a confirmed login are not returned.
 func (c *Client) LatestQR() (*QRCode, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lastQR == nil {
+	if c.loggedIn.Load() {
 		return nil, false
 	}
-	return c.lastQR, true
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
+	if c.loginStage == "verification_required" || c.loginStage == "logging_in" || c.lastQR == nil || time.Since(c.lastQR.CapturedAt) >= qrCacheTTL {
+		return nil, false
+	}
+	qr := *c.lastQR
+	return &qr, true
 }
 
 func (c *Client) setLastQR(qr *QRCode) {
-	c.mu.Lock()
-	c.lastQR = qr
-	c.mu.Unlock()
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if qr == nil {
+		c.lastQR = nil
+		return
+	}
+	copy := *qr
+	c.lastQR = &copy
 }
 
 // ---------- 一站式登录状态：等价于演示程序的 GET /qr，但不需要起 HTTP 接口 ----------
@@ -272,8 +283,57 @@ type LoginStatus struct {
 
 	// 浏览器正忙着（正在启动 / 正在抓码 / 正在确认登录态），本次没拿到二维码。
 	// 前端据此显示「正在准备中，请稍候」，而不是把空状态当成故障一直问。
-	Busy  bool   `json:"busy,omitempty"`
-	Stage string `json:"stage,omitempty"` // booting / fetching / logging_in / reset
+	Busy         bool             `json:"busy,omitempty"`
+	Stage        string           `json:"stage,omitempty"` // booting / fetching / logging_in / waiting_scan / verification_required / error
+	Error        string           `json:"error,omitempty"` // latest preparation/capture error, cleared after success
+	Verification *SMSVerification `json:"verification,omitempty"`
+}
+
+// CachedLoginStatus never calls CDP or acquires the browser operation lock.
+func (c *Client) CachedLoginStatus() *LoginStatus {
+	c.snapshotMu.RLock()
+	defer c.snapshotMu.RUnlock()
+	if c.loggedIn.Load() {
+		return &LoginStatus{LoggedIn: true}
+	}
+	st := &LoginStatus{Stage: c.loginStage, Error: c.loginError, Verification: cloneVerification(c.verification)}
+	if st.Stage == "verification_required" {
+		if st.Verification != nil {
+			if st.Verification.Step == "code_sent" || st.Verification.Step == "verifying" {
+				st.Error = st.Verification.Error
+			}
+			if st.Verification.Step == "verifying" {
+				st.Busy = true
+			}
+		}
+		return st
+	}
+	if st.Stage == "logging_in" {
+		st.Busy = true
+		return st
+	}
+	if c.lastQR != nil && time.Since(c.lastQR.CapturedAt) < qrCacheTTL {
+		qr := statusFromQR(c.lastQR)
+		qr.Stage = "waiting_scan"
+		return qr
+	}
+	if st.Stage == "" || st.Stage == "waiting_scan" {
+		st.Stage = "fetching"
+	}
+	st.Busy = st.Stage != "error"
+	return st
+}
+
+func (c *Client) setLoginProgress(stage string, err error) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	previous := c.loginStage
+	c.loginStage = stage
+	if err != nil {
+		c.loginError = err.Error()
+	} else if stage == "" || stage == "waiting_scan" || stage == "booting" || previous == "verification_required" {
+		c.loginError = ""
+	}
 }
 
 // Text 可直接展示的中文状态
@@ -281,12 +341,14 @@ func (s LoginStatus) Text() string {
 	switch {
 	case s.LoggedIn:
 		return "已登录"
+	case s.Stage == "verification_required":
+		return "抖音要求身份验证，请由账号本人完成短信验证"
 	case s.Stage == "logging_in":
 		return "已检测到登录状态，正在确认（请稍候，勿关闭页面）"
 	case s.Stage == "reset":
 		return "登录态失效，正在重新获取二维码"
 	case s.Busy || s.Stage != "":
-		return "程序正在启动浏览器并获取二维码（首次约 20~30 秒），请稍候"
+		return "程序正在准备浏览器和二维码，请稍候"
 	}
 	return "未登录，请用抖音 App 扫码"
 }
@@ -314,50 +376,44 @@ const qrCacheTTL = 90 * time.Second
 // 若另一个 goroutine 正在抓码（例如 EnsureLogin 正在跑），本次会立即返回空状态
 // （LoggedIn=false、无二维码），下次轮询即可拿到，不会阻塞。
 func (c *Client) QRStatus() (*LoginStatus, error) {
+	return c.qrStatusContext(context.Background())
+}
+
+func (c *Client) qrStatusContext(ctx context.Context) (*LoginStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !c.mu.TryLock() {
-		// 浏览器正被别的流程占用（首次启动 / EnsureLogin 正在抓码 / 正在处理会话）。
-		// 明确告诉前端「在忙」，否则前端只会无限显示「正在获取二维码…」。
-		return &LoginStatus{Busy: true, Stage: "fetching"}, nil
+		return c.CachedLoginStatus(), nil
 	}
 	defer c.mu.Unlock()
-
-	if err := c.connectWithBackoffLocked(); err != nil {
+	if err := c.connectWithBackoffContextLocked(ctx); err != nil {
 		return nil, err
 	}
-	if c.loggedInLocked() {
-		c.authPendingAt = time.Time{}
+	state, err := c.observeLoginLocked(ctx)
+	if err != nil {
+		return &LoginStatus{Busy: true, Stage: "logging_in"}, nil
+	}
+	if state.ready() {
 		return &LoginStatus{LoggedIn: true}, nil
 	}
-	// 未登录：90 秒内的缓存直接复用，避免每次轮询都重新截图
-	if c.lastQR != nil && time.Since(c.lastQR.CapturedAt) < qrCacheTTL {
-		return statusFromQR(c.lastQR), nil
+	if state.VerificationRequired || !state.QRVisible {
+		err := c.handleLoginPendingLocked(ctx, state)
+		if err != nil && !errors.Is(err, errAuthPending) && !errors.Is(err, errVerificationRequired) {
+			return nil, err
+		}
+		return c.CachedLoginStatus(), nil
 	}
-	qr, err := c.fetchQRLocked()
+	if qr, ok := c.LatestQR(); ok {
+		return statusFromQR(qr), nil
+	}
+	qr, err := c.fetchQRContextLocked(ctx)
+	if errors.Is(err, errAuthPending) || errors.Is(err, errVerificationRequired) {
+		return c.CachedLoginStatus(), nil
+	}
 	if err != nil {
-		if errors.Is(err, errAuthPending) {
-			// 正在登录（cookie 已到、页面还在跳转）：给前端一个「确认中」状态，下次轮询再问，
-			// 不要报错 —— 报错会让前端弹「获取二维码失败」，而实际上用户已经扫成功了。
-			// 但如果是「过期 sessionid 赖着不走」，这里会永远等不到登录页 —— 超过 90 秒就清干净重出码。
-			if c.authPendingAt.IsZero() {
-				c.authPendingAt = time.Now()
-				return &LoginStatus{Busy: true, Stage: "logging_in"}, nil
-			}
-			if time.Since(c.authPendingAt) > 90*time.Second {
-				c.lg.Log("登录 cookie 长期无法进入私信页（>90 秒，疑似已失效），清除后重新出码 ...")
-				c.authPendingAt = time.Time{}
-				c.lastQR = nil
-				c.resetGuestLocked()
-				return &LoginStatus{Busy: true, Stage: "reset"}, nil
-			}
-			return &LoginStatus{Busy: true, Stage: "logging_in"}, nil
-		}
-		if c.lastQR != nil { // 抓不到新码就退回旧码，前端至少还有图可显示
-			return statusFromQR(c.lastQR), nil
-		}
 		return nil, err
 	}
-	c.authPendingAt = time.Time{}
-	c.lastQR = qr
 	return statusFromQR(qr), nil
 }
 

@@ -101,7 +101,7 @@ func (m *Manager) AutoReply(name string) (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	return c.cfg.AutoReply, true
+	return c.runtimeConfig().AutoReply, true
 }
 
 // Names 已创建的账号名（按字典序）。
